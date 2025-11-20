@@ -27,7 +27,7 @@ thiserror = "2"
 rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
 
 # DataFusion
-datafusion = "42"
+datafusion = "51"
 
 # API/Server
 axum = "0.8"
