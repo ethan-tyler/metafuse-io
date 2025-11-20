@@ -21,7 +21,7 @@ version = "0.1.0"
 # Core dependencies
 serde = { version = "1", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
-thiserror = "1"
+thiserror = "2"
 
 # Database
 rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
