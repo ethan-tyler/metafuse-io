@@ -24,7 +24,7 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 
 # Database
-rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
+rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
 
 # DataFusion
 datafusion = "42"
