@@ -5,6 +5,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub mod validation;
+
 /// Metadata for a dataset in the catalog
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatasetMeta {
@@ -74,6 +76,12 @@ pub enum CatalogError {
 
     #[error("Serialization error: {0}")]
     SerializationError(String),
+
+    #[error("Validation error: {0}")]
+    ValidationError(String),
+
+    #[error("Database error: {0}")]
+    DatabaseError(String),
 
     #[error("Other error: {0}")]
     Other(String),

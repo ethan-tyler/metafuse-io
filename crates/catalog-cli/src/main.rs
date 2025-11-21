@@ -3,6 +3,7 @@
 //! Command-line interface for exploring and managing the MetaFuse catalog.
 
 use clap::{Parser, Subcommand};
+use metafuse_catalog_core::validation;
 use metafuse_catalog_storage::backend_from_uri;
 
 #[derive(Parser)]
@@ -305,8 +306,8 @@ fn show_dataset(
         ))
     })?;
 
-    for field in fields {
-        let (field_name, data_type, nullable) = field?;
+    for field in fields.flatten() {
+        let (field_name, data_type, nullable) = field;
         let null_str = if nullable != 0 {
             "nullable"
         } else {
@@ -361,6 +362,9 @@ fn show_dataset(
 }
 
 fn search_datasets(path: &str, query: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Sanitize FTS query to prevent injection and validate length
+    let sanitized_query = validation::sanitize_fts_query(query)?;
+
     let backend = backend_from_uri(path)?;
     let conn = backend.get_connection()?;
 
@@ -368,13 +372,13 @@ fn search_datasets(path: &str, query: &str) -> Result<(), Box<dyn std::error::Er
         r#"
         SELECT d.name, d.path, d.format, d.domain
         FROM datasets d
-        JOIN dataset_search s ON d.id = s.rowid
+        JOIN dataset_search s ON d.name = s.dataset_name
         WHERE dataset_search MATCH ?1
-        ORDER BY rank
+        ORDER BY bm25(dataset_search)
         "#,
     )?;
 
-    let results = stmt.query_map([query], |row| {
+    let results = stmt.query_map([&sanitized_query], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -449,14 +453,22 @@ fn show_stats(path: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn format_number(n: i64) -> String {
-    n.to_string()
-        .as_bytes()
-        .rchunks(3)
-        .rev()
-        .map(std::str::from_utf8)
-        .collect::<Result<Vec<&str>, _>>()
-        .unwrap()
-        .join(",")
+    let negative = n.is_negative();
+    let mut digits = n.abs().to_string();
+    let mut parts = Vec::new();
+
+    while digits.len() > 3 {
+        let chunk = digits.split_off(digits.len() - 3);
+        parts.push(chunk);
+    }
+    parts.push(digits);
+    parts.reverse();
+
+    let mut formatted = parts.join(",");
+    if negative {
+        formatted.insert(0, '-');
+    }
+    formatted
 }
 
 fn format_bytes(bytes: i64) -> String {

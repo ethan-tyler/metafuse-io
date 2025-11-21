@@ -8,7 +8,7 @@
 
 MetaFuse captures dataset schemas, lineage, and operational metadata automatically from your data pipelines without requiring Kafka, MySQL, or Elasticsearch. Just a SQLite file on object storage.
 
-**Status:** Phase 1 MVP Complete (Q4 2025) - Core foundation stable. Cloud backends (GCS/S3) coming in Phase 2.
+**Status:** Phase 1 MVP Complete — local SQLite backend only. Cloud backends (GCS/S3) are feature-gated stubs and will ship in Phase 2.
 
 ## Why MetaFuse?
 

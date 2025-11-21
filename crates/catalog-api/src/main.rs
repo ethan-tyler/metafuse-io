@@ -8,6 +8,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use metafuse_catalog_core::validation;
 use metafuse_catalog_storage::{backend_from_uri, DynCatalogBackend};
 use rusqlite::params_from_iter;
 use serde::{Deserialize, Serialize};
@@ -335,6 +336,10 @@ async fn search_datasets(
         .get("q")
         .ok_or_else(|| bad_request("Missing 'q' parameter".to_string()))?;
 
+    // Sanitize FTS query to prevent injection and validate length
+    let sanitized_query =
+        validation::sanitize_fts_query(query).map_err(|e| bad_request(e.to_string()))?;
+
     let conn = state
         .backend
         .get_connection()
@@ -354,7 +359,7 @@ async fn search_datasets(
         .map_err(|e| internal_error(e.to_string()))?;
 
     let datasets = stmt
-        .query_map([query], |row| {
+        .query_map([&sanitized_query], |row| {
             let row_count: Option<i64> = row.get(10)?;
             let size_bytes: Option<i64> = row.get(11)?;
             let partition_keys = parse_partition_keys(row.get::<_, Option<String>>(12)?);

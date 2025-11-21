@@ -5,8 +5,8 @@
 use chrono::Utc;
 use datafusion::arrow::datatypes::SchemaRef;
 use metafuse_catalog_core::{
-    get_catalog_version, increment_catalog_version, init_sqlite_schema, CatalogError, DatasetMeta,
-    FieldMeta, OperationalMeta, Result,
+    get_catalog_version, increment_catalog_version, init_sqlite_schema, validation, CatalogError,
+    DatasetMeta, FieldMeta, OperationalMeta, Result,
 };
 use metafuse_catalog_storage::CatalogBackend;
 use rusqlite::Connection;
@@ -88,6 +88,48 @@ impl<B: CatalogBackend> Emitter<B> {
         upstream_datasets: Vec<String>,
         tags: Vec<String>,
     ) -> Result<()> {
+        // ===== Input Validation =====
+        // Validate dataset name
+        validation::validate_dataset_name(name)?;
+
+        // Validate tenant if provided
+        if let Some(t) = tenant {
+            validation::validate_identifier(t, "tenant")?;
+        }
+
+        // Validate domain if provided
+        if let Some(d) = domain {
+            validation::validate_identifier(d, "domain")?;
+        }
+
+        // Validate all tags
+        for tag in &tags {
+            validation::validate_tag(tag)?;
+        }
+
+        // Validate all field names from schema
+        for field in schema.fields() {
+            validation::validate_field_name(field.name())?;
+        }
+
+        // Validate upstream dataset names
+        for upstream in &upstream_datasets {
+            validation::validate_dataset_name(upstream)?;
+        }
+
+        // Validate partition keys if present in operational metadata
+        if let Some(ref op) = operational {
+            for partition_key in &op.partition_keys {
+                validation::validate_field_name(partition_key)?;
+            }
+        }
+
+        // Validate path for traversal attacks (basic check)
+        if let Some(file_path) = path.strip_prefix("file://") {
+            validation::validate_file_uri_path(file_path)?;
+        }
+        // ===== End Validation =====
+
         // Convert Arrow schema to FieldMeta
         let fields = schema
             .fields()

@@ -672,3 +672,221 @@ fn test_operational_metadata() {
     let partition_keys: Vec<String> = serde_json::from_str(&partition_keys_json.unwrap()).unwrap();
     assert_eq!(partition_keys, vec!["region", "date"]);
 }
+
+// ===== Validation Error Tests =====
+
+#[test]
+fn test_validation_reject_invalid_dataset_name() {
+    let (_temp_dir, backend) = create_test_backend();
+    let emitter = Emitter::new(backend);
+    let schema = create_sample_schema();
+
+    // Test: Dataset name with spaces (invalid)
+    let result = emitter.emit_dataset(
+        "invalid dataset name", // Spaces not allowed
+        "/data/test.parquet",
+        "parquet",
+        None,
+        None,
+        None,
+        None,
+        schema.clone(),
+        None,
+        vec![],
+        vec![],
+    );
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("invalid characters"));
+
+    // Test: Dataset name starting with hyphen (invalid)
+    let result = emitter.emit_dataset(
+        "-invalid",
+        "/data/test.parquet",
+        "parquet",
+        None,
+        None,
+        None,
+        None,
+        schema.clone(),
+        None,
+        vec![],
+        vec![],
+    );
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("cannot start or end with hyphen"));
+
+    // Test: Empty dataset name (invalid)
+    let result = emitter.emit_dataset(
+        "",
+        "/data/test.parquet",
+        "parquet",
+        None,
+        None,
+        None,
+        None,
+        schema,
+        None,
+        vec![],
+        vec![],
+    );
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+}
+
+#[test]
+fn test_validation_reject_invalid_tags() {
+    let (_temp_dir, backend) = create_test_backend();
+    let emitter = Emitter::new(backend);
+    let schema = create_sample_schema();
+
+    // Test: Tag with spaces (invalid)
+    let result = emitter.emit_dataset(
+        "test_dataset",
+        "/data/test.parquet",
+        "parquet",
+        None,
+        None,
+        None,
+        None,
+        schema.clone(),
+        None,
+        vec![],
+        vec!["invalid tag".to_string()], // Space not allowed
+    );
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("invalid characters"));
+
+    // Test: Tag with @ symbol (invalid)
+    let result = emitter.emit_dataset(
+        "test_dataset",
+        "/data/test.parquet",
+        "parquet",
+        None,
+        None,
+        None,
+        None,
+        schema,
+        None,
+        vec![],
+        vec!["tag@value".to_string()], // @ not allowed
+    );
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("invalid characters"));
+}
+
+#[test]
+fn test_validation_reject_invalid_field_names() {
+    let (_temp_dir, backend) = create_test_backend();
+    let emitter = Emitter::new(backend);
+
+    // Create schema with invalid field name (contains hyphen)
+    let invalid_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("invalid-field", DataType::Utf8, true), // Hyphen not allowed
+    ]));
+
+    let result = emitter.emit_dataset(
+        "test_dataset",
+        "/data/test.parquet",
+        "parquet",
+        None,
+        None,
+        None,
+        None,
+        invalid_schema,
+        None,
+        vec![],
+        vec![],
+    );
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("invalid characters"));
+}
+
+#[test]
+fn test_validation_reject_invalid_tenant_domain() {
+    let (_temp_dir, backend) = create_test_backend();
+    let emitter = Emitter::new(backend);
+    let schema = create_sample_schema();
+
+    // Test: Tenant with colon (invalid)
+    let result = emitter.emit_dataset(
+        "test_dataset",
+        "/data/test.parquet",
+        "parquet",
+        None,
+        Some("tenant:invalid"), // Colon not allowed in identifiers
+        None,
+        None,
+        schema.clone(),
+        None,
+        vec![],
+        vec![],
+    );
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("invalid characters"));
+
+    // Test: Domain with space (invalid)
+    let result = emitter.emit_dataset(
+        "test_dataset",
+        "/data/test.parquet",
+        "parquet",
+        None,
+        None,
+        Some("invalid domain"), // Space not allowed
+        None,
+        schema,
+        None,
+        vec![],
+        vec![],
+    );
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("invalid characters"));
+}
+
+#[test]
+fn test_validation_accept_valid_inputs() {
+    let (_temp_dir, backend) = create_test_backend();
+    let emitter = Emitter::new(backend);
+    let schema = create_sample_schema();
+
+    // All valid inputs should succeed
+    let result = emitter.emit_dataset(
+        "valid_dataset-name.v2", // Valid: alphanumeric, underscore, hyphen, dot
+        "/data/test.parquet",
+        "parquet",
+        Some("Valid description"),
+        Some("prod-tenant"),      // Valid: alphanumeric, hyphen
+        Some("analytics_domain"), // Valid: alphanumeric, underscore
+        Some("team@example.com"),
+        schema,
+        Some(OperationalMeta {
+            row_count: Some(1000),
+            size_bytes: Some(50000),
+            partition_keys: vec!["year".to_string(), "month".to_string()],
+        }),
+        vec!["upstream_dataset".to_string()],
+        vec!["env:prod".to_string(), "team-analytics".to_string()], // Valid tags with colon and hyphen
+    );
+    assert!(result.is_ok());
+}
