@@ -368,9 +368,9 @@ fn search_datasets(path: &str, query: &str) -> Result<(), Box<dyn std::error::Er
         r#"
         SELECT d.name, d.path, d.format, d.domain
         FROM datasets d
-        JOIN dataset_search s ON d.id = s.rowid
+        JOIN dataset_search s ON d.name = s.dataset_name
         WHERE dataset_search MATCH ?1
-        ORDER BY rank
+        ORDER BY bm25(dataset_search)
         "#,
     )?;
 
