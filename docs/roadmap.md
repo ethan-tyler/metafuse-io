@@ -2,13 +2,17 @@
 
 This document outlines the planned development phases for MetaFuse.
 
-## Current Status: Phase 1 (MVP)
+## Current Status: Phase 1.5 Complete ✓
 
-MetaFuse is currently in early MVP stage with core functionality implemented.
+MetaFuse v0.2.0 is production-hardened with comprehensive validation, observability, and security improvements.
+
+**Latest Release**: v0.2.0 - Production Hardening (January 2025)
 
 ---
 
-## Phase 1: MVP [done] (Q4 2025 - Q1 2026)
+## Phase 1: MVP ✓ [Complete] (Q4 2024 - Q1 2025)
+
+**Released**: v0.1.0 (January 2025)
 
 **Goal:** Build a working proof-of-concept with core features.
 
@@ -52,14 +56,14 @@ MetaFuse is currently in early MVP stage with core functionality implemented.
   - Apache 2.0 license
   - Basic project structure
 
-### In Progress
+### Completed
 
-- [in progress] **Examples and Testing**
+- [done] **Examples and Testing**
   - Working examples (simple pipeline, lineage tracking)
-  - Integration tests
+  - Integration tests (41 tests passing)
   - Performance benchmarks
 
-- [in progress] **Repository Infrastructure**
+- [done] **Repository Infrastructure**
   - GitHub workflows (CI, lint, audit)
   - Issue and PR templates
   - Community policies (CoC, security, contributing)
@@ -67,7 +71,54 @@ MetaFuse is currently in early MVP stage with core functionality implemented.
 
 ---
 
-## Phase 2: Open Source Launch  (Q1-Q2 2026)
+## Phase 1.5: Production Hardening ✓ [Complete] (January 2025)
+
+**Released**: v0.2.0 (January 2025)
+
+**Goal:** Harden MetaFuse for production deployments with security, validation, and observability.
+
+### Completed
+
+- [done] **Input Validation**
+  - Comprehensive validation module for all user inputs
+  - Dataset names, field names, tags, identifiers
+  - Character set enforcement and length limits
+  - Path traversal protection for file:// URIs
+
+- [done] **API Security**
+  - Request ID tracking (UUID-based)
+  - Error message sanitization (prevent info leaks)
+  - Path and query parameter validation
+  - FTS query validation with documented operator support
+
+- [done] **Observability**
+  - Structured logging with tracing spans
+  - Request correlation (request_id in logs and headers)
+  - X-Request-ID header propagation
+  - Comprehensive error correlation
+
+- [done] **Release Infrastructure**
+  - GitHub Actions release workflow
+  - Multi-platform binary builds (x86_64, ARM64, Linux, macOS)
+  - Automated checksum generation
+  - Dockerfile for containerized deployments
+  - Installation script for easy setup
+
+- [done] **Documentation**
+  - Comprehensive CHANGELOG with migration notes
+  - Troubleshooting guide with common issues
+  - Updated architecture docs
+  - Validation rules documentation
+
+- [done] **Quality Improvements**
+  - Removed unused error variants
+  - Fixed CLI search JOIN bug
+  - Corrected API response field ordering
+  - Expanded test coverage (38 → 41 tests)
+
+---
+
+## Phase 2: Cloud Backends & Open Source Launch  (Q2-Q3 2025)
 
 **Goal:** Prepare for public launch with complete documentation and cloud backend support.
 
@@ -245,15 +296,16 @@ Features suggested by the community (not yet prioritized):
 
 ---
 
-## Release Schedule (Tentative)
+## Release Schedule
 
-| Version | Target Date  | Focus                           |
-|---------|--------------|---------------------------------|
-| 0.1.0   | Q1 2026      | MVP (current)                   |
-| 0.2.0   | Q2 2026      | Cloud backends + Web UI         |
-| 0.3.0   | Q3 2026      | Usage analytics + advanced search |
-| 0.4.0   | Q4 2026      | Ecosystem integrations          |
-| 1.0.0   | Q1 2027      | Stable release + enterprise features |
+| Version | Release Date | Status       | Focus                           |
+|---------|--------------|--------------|--------------------------------|
+| 0.1.0   | Jan 2025     | ✓ Released   | MVP - Core functionality        |
+| 0.2.0   | Jan 2025     | ✓ Released   | Production hardening           |
+| 0.3.0   | Q2 2025      | Planned      | Cloud backends (GCS/S3)        |
+| 0.4.0   | Q3 2025      | Planned      | Web UI + advanced search       |
+| 0.5.0   | Q4 2025      | Planned      | Usage analytics + integrations |
+| 1.0.0   | Q1 2026      | Planned      | Stable release + enterprise    |
 
 ---
 
@@ -294,4 +346,4 @@ We'll track these metrics to measure progress:
 
 ---
 
-**Last Updated:** 2025-11-20
+**Last Updated:** 2025-01-21

@@ -8,7 +8,7 @@
 
 MetaFuse captures dataset schemas, lineage, and operational metadata automatically from your data pipelines without requiring Kafka, MySQL, or Elasticsearch. Just a SQLite file on object storage.
 
-**Status:** Phase 1 MVP Complete — local SQLite backend only. Cloud backends (GCS/S3) are feature-gated stubs and will ship in Phase 2.
+**Status:** v0.2.0 Production-Ready — Hardened for production with comprehensive validation, observability, and security. Local SQLite backend fully supported. Cloud backends (GCS/S3) coming in v0.3.0.
 
 ## Why MetaFuse?
 
@@ -27,10 +27,27 @@ MetaFuse fills the gap between expensive, complex enterprise catalogs (DataHub, 
 
 ### Install
 
+#### Option 1: Install Script (Recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ethan-tyler/MetaFuse/main/install.sh | bash
+```
+
+This downloads pre-built binaries for your platform (Linux/macOS, x86_64/ARM64).
+
+#### Option 2: Build from Source
+
 ```bash
 git clone https://github.com/ethan-tyler/MetaFuse.git
 cd MetaFuse
 cargo build --release
+```
+
+#### Option 3: Docker
+
+```bash
+docker pull ghcr.io/ethan-tyler/metafuse-api:latest
+docker run -p 8080:8080 -v $(pwd)/data:/data ghcr.io/ethan-tyler/metafuse-api
 ```
 
 ### Initialize Catalog

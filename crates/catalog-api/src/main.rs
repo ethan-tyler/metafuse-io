@@ -3,8 +3,10 @@
 //! REST API for querying the MetaFuse catalog.
 
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{Extension, Path, Query, Request, State},
+    http::{header, HeaderValue, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     routing::get,
     Json, Router,
 };
@@ -15,7 +17,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
+use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
+
+/// Request ID for tracking requests through the system
+#[derive(Debug, Clone)]
+struct RequestId(String);
 
 /// Application state shared across handlers
 struct AppState {
@@ -73,14 +81,15 @@ struct OperationalMetaResponse {
     size_bytes: Option<i64>,
     partition_keys: Vec<String>,
 }
-/// Error response
+/// Error response with request ID for tracing
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
+    request_id: String,
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -95,18 +104,18 @@ async fn main() {
 
     tracing::info!("Using catalog at: {}", catalog_path);
 
-    let backend = backend_from_uri(&catalog_path).unwrap_or_else(|e| {
+    let backend = backend_from_uri(&catalog_path).map_err(|e| {
         tracing::error!("Failed to create backend: {}", e);
-        std::process::exit(1);
-    });
+        e
+    })?;
 
     // Check if catalog exists for local backends
     if let Ok(false) = backend.exists() {
         tracing::warn!("Catalog does not exist, initializing new catalog");
-        if let Err(e) = backend.initialize() {
+        backend.initialize().map_err(|e| {
             tracing::error!("Failed to initialize catalog: {}", e);
-            std::process::exit(1);
-        }
+            e
+        })?;
     }
 
     let state = AppState {
@@ -119,6 +128,7 @@ async fn main() {
         .route("/api/v1/datasets", get(list_datasets))
         .route("/api/v1/datasets/:name", get(get_dataset))
         .route("/api/v1/search", get(search_datasets))
+        .layer(middleware::from_fn(request_id_middleware))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -127,13 +137,47 @@ async fn main() {
         .or_else(|_| std::env::var("PORT"))
         .unwrap_or_else(|_| "8080".to_string())
         .parse::<u16>()
-        .expect("PORT must be a valid number");
+        .map_err(|e| {
+            tracing::error!("PORT must be a valid number: {}", e);
+            e
+        })?;
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("MetaFuse API listening on {}", addr);
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+/// Middleware to add request ID to every request and create tracing span
+async fn request_id_middleware(mut req: Request, next: Next) -> Response {
+    let request_id = RequestId(Uuid::new_v4().to_string());
+    req.extensions_mut().insert(request_id.clone());
+
+    // Create a span that will correlate all logs for this request
+    let span = tracing::info_span!(
+        "request",
+        request_id = %request_id.0,
+        method = %req.method(),
+        uri = %req.uri(),
+    );
+
+    async move {
+        tracing::info!("Request started");
+        let mut response = next.run(req).await;
+        // Propagate request ID to response headers for client correlation
+        if let Ok(value) = HeaderValue::from_str(&request_id.0) {
+            response
+                .headers_mut()
+                .insert(header::HeaderName::from_static("x-request-id"), value);
+        }
+        tracing::info!(status = %response.status(), "Request completed");
+        response
+    }
+    .instrument(span)
+    .await
 }
 
 /// Health check endpoint
@@ -144,12 +188,13 @@ async fn health_check() -> &'static str {
 /// List all datasets
 async fn list_datasets(
     State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<DatasetResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let conn = state
         .backend
         .get_connection()
-        .map_err(|e| internal_error(e.to_string()))?;
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     let mut query = String::from(
         r#"
@@ -162,12 +207,18 @@ async fn list_datasets(
 
     let mut bindings: Vec<String> = Vec::new();
 
+    // Validate and apply tenant filter
     if let Some(tenant) = params.get("tenant") {
+        validation::validate_identifier(tenant, "tenant")
+            .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
         query.push_str(" AND tenant = ?");
         bindings.push(tenant.clone());
     }
 
+    // Validate and apply domain filter
     if let Some(domain) = params.get("domain") {
+        validation::validate_identifier(domain, "domain")
+            .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
         query.push_str(" AND domain = ?");
         bindings.push(domain.clone());
     }
@@ -176,7 +227,7 @@ async fn list_datasets(
 
     let mut stmt = conn
         .prepare(&query)
-        .map_err(|e| internal_error(e.to_string()))?;
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     let datasets = stmt
         .query_map(params_from_iter(bindings.iter()), |row| {
@@ -201,9 +252,9 @@ async fn list_datasets(
                 },
             })
         })
-        .map_err(|e| internal_error(e.to_string()))?
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| internal_error(e.to_string()))?;
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     Ok(Json(datasets))
 }
@@ -211,12 +262,17 @@ async fn list_datasets(
 /// Get a specific dataset by name
 async fn get_dataset(
     State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
     Path(name): Path<String>,
 ) -> Result<Json<DatasetDetailResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Validate dataset name
+    validation::validate_dataset_name(&name)
+        .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+
     let conn = state
         .backend
         .get_connection()
-        .map_err(|e| internal_error(e.to_string()))?;
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     // Get dataset
     let dataset: DatasetResponse = conn
@@ -251,12 +307,17 @@ async fn get_dataset(
                 })
             },
         )
-        .map_err(|_| not_found(format!("Dataset '{}' not found", name)))?;
+        .map_err(|_| {
+            not_found(
+                format!("Dataset '{}' not found", name),
+                request_id.0.clone(),
+            )
+        })?;
 
     // Get fields
     let mut stmt = conn
         .prepare("SELECT name, data_type, nullable, description FROM fields WHERE dataset_id = ?1")
-        .map_err(|e| internal_error(e.to_string()))?;
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     let fields = stmt
         .query_map([dataset.id], |row| {
@@ -267,20 +328,20 @@ async fn get_dataset(
                 description: row.get(3)?,
             })
         })
-        .map_err(|e| internal_error(e.to_string()))?
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| internal_error(e.to_string()))?;
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     // Get tags
     let mut stmt = conn
         .prepare("SELECT tag FROM tags WHERE dataset_id = ?1")
-        .map_err(|e| internal_error(e.to_string()))?;
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     let tags = stmt
         .query_map([dataset.id], |row| row.get::<_, String>(0))
-        .map_err(|e| internal_error(e.to_string()))?
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| internal_error(e.to_string()))?;
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     // Get upstream datasets
     let mut stmt = conn
@@ -292,13 +353,13 @@ async fn get_dataset(
             WHERE l.downstream_dataset_id = ?1
             "#,
         )
-        .map_err(|e| internal_error(e.to_string()))?;
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     let upstream_datasets = stmt
         .query_map([dataset.id], |row| row.get::<_, String>(0))
-        .map_err(|e| internal_error(e.to_string()))?
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| internal_error(e.to_string()))?;
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     // Get downstream datasets
     let mut stmt = conn
@@ -310,13 +371,13 @@ async fn get_dataset(
             WHERE l.upstream_dataset_id = ?1
             "#,
         )
-        .map_err(|e| internal_error(e.to_string()))?;
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     let downstream_datasets = stmt
         .query_map([dataset.id], |row| row.get::<_, String>(0))
-        .map_err(|e| internal_error(e.to_string()))?
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| internal_error(e.to_string()))?;
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     Ok(Json(DatasetDetailResponse {
         dataset,
@@ -330,20 +391,21 @@ async fn get_dataset(
 /// Search datasets using FTS
 async fn search_datasets(
     State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<DatasetResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let query = params
         .get("q")
-        .ok_or_else(|| bad_request("Missing 'q' parameter".to_string()))?;
+        .ok_or_else(|| bad_request("Missing 'q' parameter".to_string(), request_id.0.clone()))?;
 
-    // Sanitize FTS query to prevent injection and validate length
-    let sanitized_query =
-        validation::sanitize_fts_query(query).map_err(|e| bad_request(e.to_string()))?;
+    // Validate FTS query (operators are allowed for powerful search)
+    let validated_query = validation::validate_fts_query(query)
+        .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
 
     let conn = state
         .backend
         .get_connection()
-        .map_err(|e| internal_error(e.to_string()))?;
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     let mut stmt = conn
         .prepare(
@@ -356,10 +418,10 @@ async fn search_datasets(
             ORDER BY bm25(dataset_search)
             "#,
         )
-        .map_err(|e| internal_error(e.to_string()))?;
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     let datasets = stmt
-        .query_map([&sanitized_query], |row| {
+        .query_map([&validated_query], |row| {
             let row_count: Option<i64> = row.get(10)?;
             let size_bytes: Option<i64> = row.get(11)?;
             let partition_keys = parse_partition_keys(row.get::<_, Option<String>>(12)?);
@@ -381,34 +443,53 @@ async fn search_datasets(
                 },
             })
         })
-        .map_err(|e| internal_error(e.to_string()))?
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| internal_error(e.to_string()))?;
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     Ok(Json(datasets))
 }
 
 /// Helper function to create internal error response
-fn internal_error(message: String) -> (StatusCode, Json<ErrorResponse>) {
+///
+/// Logs the detailed error message internally but returns a generic message to the client
+/// to avoid leaking implementation details.
+fn internal_error(message: String, request_id: String) -> (StatusCode, Json<ErrorResponse>) {
+    tracing::error!(error = %message, "Internal server error");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse { error: message }),
+        Json(ErrorResponse {
+            error: "Internal server error. Please contact support with the request ID.".to_string(),
+            request_id,
+        }),
     )
 }
 
 /// Helper function to create not found error response
-fn not_found(message: String) -> (StatusCode, Json<ErrorResponse>) {
+///
+/// Returns a user-friendly not found message without leaking details about what exists.
+fn not_found(message: String, request_id: String) -> (StatusCode, Json<ErrorResponse>) {
+    tracing::info!(message = %message, "Resource not found");
     (
         StatusCode::NOT_FOUND,
-        Json(ErrorResponse { error: message }),
+        Json(ErrorResponse {
+            error: message,
+            request_id,
+        }),
     )
 }
 
 /// Helper function to create bad request error response
-fn bad_request(message: String) -> (StatusCode, Json<ErrorResponse>) {
+///
+/// Validation errors are user-facing and safe to return to the client.
+fn bad_request(message: String, request_id: String) -> (StatusCode, Json<ErrorResponse>) {
+    tracing::info!(message = %message, "Bad request");
     (
         StatusCode::BAD_REQUEST,
-        Json(ErrorResponse { error: message }),
+        Json(ErrorResponse {
+            error: message,
+            request_id,
+        }),
     )
 }
 

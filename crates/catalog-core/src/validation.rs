@@ -167,13 +167,23 @@ pub fn validate_identifier(identifier: &str, field_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Sanitize FTS search query
+/// Validate FTS search query
 ///
-/// Escapes FTS5 special characters to prevent operator injection.
-/// Allows basic search but prevents complex boolean queries unless explicitly allowed.
+/// Validates query length and format. FTS5 operators (AND, OR, NOT, *, quotes, etc.)
+/// are explicitly ALLOWED to enable powerful search capabilities for data teams.
 ///
-/// FTS5 special chars: " * ( ) AND OR NOT
-pub fn sanitize_fts_query(query: &str) -> Result<String> {
+/// Security note: This is safe because:
+/// 1. Queries are passed via parameterized SQL (no SQL injection risk)
+/// 2. FTS5 syntax errors result in query failures, not security issues
+/// 3. Worst case: malformed query returns no results or error
+///
+/// Users can use FTS5 syntax like:
+/// - Simple terms: "analytics"
+/// - Phrases: "user profile"
+/// - Boolean: "analytics AND finance"
+/// - Wildcards: "user*"
+/// - Proximity: "NEAR(term1 term2, 10)"
+pub fn validate_fts_query(query: &str) -> Result<String> {
     if query.is_empty() {
         return Err(CatalogError::ValidationError(
             "Search query cannot be empty".to_string(),
@@ -188,9 +198,8 @@ pub fn sanitize_fts_query(query: &str) -> Result<String> {
         )));
     }
 
-    // For MVP, we'll allow the query as-is but validate length
-    // TODO: In future, consider more sophisticated FTS operator escaping
-    // For now, FTS5 MATCH with parameterized queries is safe
+    // Return the query as-is - FTS operators are intentionally allowed
+    // for powerful search capabilities
     Ok(query.to_string())
 }
 
@@ -295,12 +304,14 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_fts_query() {
-        assert!(sanitize_fts_query("user").is_ok());
-        assert!(sanitize_fts_query("user data").is_ok());
-        assert!(sanitize_fts_query("\"exact phrase\"").is_ok());
-        assert!(sanitize_fts_query("").is_err()); // Empty
-        assert!(sanitize_fts_query(&"a".repeat(501)).is_err()); // Too long
+    fn test_validate_fts_query() {
+        assert!(validate_fts_query("user").is_ok());
+        assert!(validate_fts_query("user data").is_ok());
+        assert!(validate_fts_query("\"exact phrase\"").is_ok());
+        assert!(validate_fts_query("analytics AND finance").is_ok()); // Operators allowed
+        assert!(validate_fts_query("user*").is_ok()); // Wildcards allowed
+        assert!(validate_fts_query("").is_err()); // Empty
+        assert!(validate_fts_query(&"a".repeat(501)).is_err()); // Too long
     }
 
     #[test]

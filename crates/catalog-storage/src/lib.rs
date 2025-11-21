@@ -149,6 +149,12 @@ pub fn parse_catalog_uri(uri: &str) -> Result<CatalogLocation> {
         .map(|p| p.to_string())
         .unwrap_or_else(|| uri.to_string());
 
+    // Validate file paths for security issues (path traversal, null bytes)
+    // Only validate if file:// prefix was present
+    if uri.starts_with("file://") {
+        metafuse_catalog_core::validation::validate_file_uri_path(&path)?;
+    }
+
     Ok(CatalogLocation::Local(PathBuf::from(path)))
 }
 
@@ -684,5 +690,44 @@ mod tests {
                 region: Some("us-east-1".to_string())
             }
         );
+    }
+
+    #[test]
+    fn test_parse_catalog_uri_file_valid() {
+        // Valid file URIs should work
+        let loc = parse_catalog_uri("file://catalog.db").unwrap();
+        assert!(matches!(loc, CatalogLocation::Local(_)));
+
+        let loc = parse_catalog_uri("file://data/catalog.db").unwrap();
+        assert!(matches!(loc, CatalogLocation::Local(_)));
+
+        // Raw paths (without file:// prefix) should also work
+        let loc = parse_catalog_uri("catalog.db").unwrap();
+        assert!(matches!(loc, CatalogLocation::Local(_)));
+    }
+
+    #[test]
+    fn test_parse_catalog_uri_file_traversal_blocked() {
+        // Path traversal attacks should be blocked for file:// URIs
+        let result = parse_catalog_uri("file://../../../etc/passwd");
+        assert!(result.is_err());
+
+        let result = parse_catalog_uri("file://data/../../../etc/passwd");
+        assert!(result.is_err());
+
+        // Null bytes should also be blocked
+        let result = parse_catalog_uri("file://data\0hidden");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_catalog_uri_raw_path_no_validation() {
+        // Raw paths (without file:// prefix) are NOT validated
+        // This allows users to use relative paths for development
+        let loc = parse_catalog_uri("../data/catalog.db").unwrap();
+        assert!(matches!(loc, CatalogLocation::Local(_)));
+
+        let loc = parse_catalog_uri("/absolute/path/catalog.db").unwrap();
+        assert!(matches!(loc, CatalogLocation::Local(_)));
     }
 }

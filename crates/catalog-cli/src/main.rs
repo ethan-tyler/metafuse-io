@@ -362,8 +362,8 @@ fn show_dataset(
 }
 
 fn search_datasets(path: &str, query: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // Sanitize FTS query to prevent injection and validate length
-    let sanitized_query = validation::sanitize_fts_query(query)?;
+    // Validate FTS query (operators are allowed for powerful search)
+    let validated_query = validation::validate_fts_query(query)?;
 
     let backend = backend_from_uri(path)?;
     let conn = backend.get_connection()?;
@@ -378,7 +378,7 @@ fn search_datasets(path: &str, query: &str) -> Result<(), Box<dyn std::error::Er
         "#,
     )?;
 
-    let results = stmt.query_map([&sanitized_query], |row| {
+    let results = stmt.query_map([&validated_query], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,

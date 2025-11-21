@@ -1,0 +1,42 @@
+# Build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# CI/CD
+.github/
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Examples and tests
+examples/
+benches/
+tests/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Local development
+.env
+*.db
+*.db-shm
+*.db-wal
+metafuse_catalog.db*
+
+# Cargo cache
+Cargo.lock

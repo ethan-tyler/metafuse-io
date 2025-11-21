@@ -75,12 +75,17 @@ MetaFuse uses a version counter in the `catalog_meta` table to safely handle con
 ```rust
 // catalog-core/src/lib.rs
 pub fn get_catalog_version(conn: &rusqlite::Connection) -> Result<i64> {
-    conn.query_row("SELECT version FROM catalog_meta", [], |row| row.get(0))
-        .map_err(|e| CatalogError::DatabaseError(e.to_string()))
+    let version: i64 = conn.query_row("SELECT version FROM catalog_meta WHERE id = 1", [], |row| {
+        row.get(0)
+    })?;
+    Ok(version)
 }
 
 pub fn increment_catalog_version(conn: &rusqlite::Connection) -> Result<i64> {
-    conn.execute("UPDATE catalog_meta SET version = version + 1", [])?;
+    conn.execute(
+        "UPDATE catalog_meta SET version = version + 1, last_modified = datetime('now') WHERE id = 1",
+        [],
+    )?;
     get_catalog_version(conn)
 }
 ```

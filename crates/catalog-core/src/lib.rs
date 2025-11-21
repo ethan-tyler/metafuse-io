@@ -80,9 +80,6 @@ pub enum CatalogError {
     #[error("Validation error: {0}")]
     ValidationError(String),
 
-    #[error("Database error: {0}")]
-    DatabaseError(String),
-
     #[error("Other error: {0}")]
     Other(String),
 }

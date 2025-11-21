@@ -10,7 +10,6 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use metafuse_catalog_core::{init_sqlite_schema, OperationalMeta};
 use metafuse_catalog_emitter::Emitter;
 use metafuse_catalog_storage::{CatalogBackend, LocalSqliteBackend};
-use serde_json;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -72,6 +71,7 @@ fn test_emit_and_query_dataset() {
         )
         .unwrap();
 
+    #[allow(clippy::type_complexity)]
     let (name, path, format, description, tenant, domain, owner, row_count): (
         String,
         String,
