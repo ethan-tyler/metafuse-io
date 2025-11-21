@@ -42,6 +42,31 @@ jobs:
       - name: Run documentation tests
         run: cargo test --doc --workspace --all-features --verbose
 
+  examples:
+    name: Examples Smoke Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build examples
+        run: |
+          cargo build --example simple_pipeline --verbose
+          cargo build --example lineage_tracking --verbose
+
+      - name: Run simple_pipeline example
+        run: cargo run --example simple_pipeline
+
+      - name: Run lineage_tracking example
+        run: cargo run --example lineage_tracking
+
   build-release:
     name: Build Release
     runs-on: ubuntu-latest

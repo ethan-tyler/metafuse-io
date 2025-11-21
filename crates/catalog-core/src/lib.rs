@@ -223,8 +223,8 @@ pub fn init_sqlite_schema(conn: &rusqlite::Connection) -> Result<()> {
         NEW.domain,
         NEW.owner,
         NEW.description,
-        COALESCE((SELECT GROUP_CONCAT(tag, ' ') FROM tags WHERE dataset_id = NEW.id), ''),
-        COALESCE((SELECT GROUP_CONCAT(name, ' ') FROM fields WHERE dataset_id = NEW.id), '')
+        COALESCE((SELECT GROUP_CONCAT(tag, ' ') FROM (SELECT tag FROM tags WHERE dataset_id = NEW.id ORDER BY tag)), ''),
+        COALESCE((SELECT GROUP_CONCAT(name, ' ') FROM (SELECT name FROM fields WHERE dataset_id = NEW.id ORDER BY name)), '')
       );
     END;
 
@@ -240,8 +240,8 @@ pub fn init_sqlite_schema(conn: &rusqlite::Connection) -> Result<()> {
         NEW.domain,
         NEW.owner,
         NEW.description,
-        COALESCE((SELECT GROUP_CONCAT(tag, ' ') FROM tags WHERE dataset_id = NEW.id), ''),
-        COALESCE((SELECT GROUP_CONCAT(name, ' ') FROM fields WHERE dataset_id = NEW.id), '')
+        COALESCE((SELECT GROUP_CONCAT(tag, ' ') FROM (SELECT tag FROM tags WHERE dataset_id = NEW.id ORDER BY tag)), ''),
+        COALESCE((SELECT GROUP_CONCAT(name, ' ') FROM (SELECT name FROM fields WHERE dataset_id = NEW.id ORDER BY name)), '')
       );
     END;
 
@@ -264,8 +264,8 @@ pub fn init_sqlite_schema(conn: &rusqlite::Connection) -> Result<()> {
         d.domain,
         d.owner,
         d.description,
-        COALESCE((SELECT GROUP_CONCAT(tag, ' ') FROM tags WHERE dataset_id = d.id), ''),
-        COALESCE((SELECT GROUP_CONCAT(name, ' ') FROM fields WHERE dataset_id = d.id), '')
+        COALESCE((SELECT GROUP_CONCAT(tag, ' ') FROM (SELECT tag FROM tags WHERE dataset_id = d.id ORDER BY tag)), ''),
+        COALESCE((SELECT GROUP_CONCAT(name, ' ') FROM (SELECT name FROM fields WHERE dataset_id = d.id ORDER BY name)), '')
       FROM datasets d WHERE d.id = NEW.dataset_id;
     END;
 
@@ -280,8 +280,8 @@ pub fn init_sqlite_schema(conn: &rusqlite::Connection) -> Result<()> {
         d.domain,
         d.owner,
         d.description,
-        COALESCE((SELECT GROUP_CONCAT(tag, ' ') FROM tags WHERE dataset_id = d.id), ''),
-        COALESCE((SELECT GROUP_CONCAT(name, ' ') FROM fields WHERE dataset_id = d.id), '')
+        COALESCE((SELECT GROUP_CONCAT(tag, ' ') FROM (SELECT tag FROM tags WHERE dataset_id = d.id ORDER BY tag)), ''),
+        COALESCE((SELECT GROUP_CONCAT(name, ' ') FROM (SELECT name FROM fields WHERE dataset_id = d.id ORDER BY name)), '')
       FROM datasets d WHERE d.id = OLD.dataset_id;
     END;
 
@@ -297,8 +297,8 @@ pub fn init_sqlite_schema(conn: &rusqlite::Connection) -> Result<()> {
         d.domain,
         d.owner,
         d.description,
-        COALESCE((SELECT GROUP_CONCAT(tag, ' ') FROM tags WHERE dataset_id = d.id), ''),
-        COALESCE((SELECT GROUP_CONCAT(name, ' ') FROM fields WHERE dataset_id = d.id), '')
+        COALESCE((SELECT GROUP_CONCAT(tag, ' ') FROM (SELECT tag FROM tags WHERE dataset_id = d.id ORDER BY tag)), ''),
+        COALESCE((SELECT GROUP_CONCAT(name, ' ') FROM (SELECT name FROM fields WHERE dataset_id = d.id ORDER BY name)), '')
       FROM datasets d WHERE d.id = NEW.dataset_id;
     END;
 
@@ -313,8 +313,8 @@ pub fn init_sqlite_schema(conn: &rusqlite::Connection) -> Result<()> {
         d.domain,
         d.owner,
         d.description,
-        COALESCE((SELECT GROUP_CONCAT(tag, ' ') FROM tags WHERE dataset_id = d.id), ''),
-        COALESCE((SELECT GROUP_CONCAT(name, ' ') FROM fields WHERE dataset_id = d.id), '')
+        COALESCE((SELECT GROUP_CONCAT(tag, ' ') FROM (SELECT tag FROM tags WHERE dataset_id = d.id ORDER BY tag)), ''),
+        COALESCE((SELECT GROUP_CONCAT(name, ' ') FROM (SELECT name FROM fields WHERE dataset_id = d.id ORDER BY name)), '')
       FROM datasets d WHERE d.id = OLD.dataset_id;
     END;
     "#;

@@ -8,16 +8,18 @@
 
 MetaFuse captures dataset schemas, lineage, and operational metadata automatically from your data pipelines without requiring Kafka, MySQL, or Elasticsearch. Just a SQLite file on object storage.
 
-**Status:** Early MVP. APIs will evolve.
+**Status:** Phase 1 MVP Complete (Q4 2025) - Core foundation stable. Cloud backends (GCS/S3) coming in Phase 2.
 
 ## Why MetaFuse?
 
 - **Native DataFusion integration** - Emit metadata directly from pipelines
-- **Serverless-friendly** - $0-$5/month on object storage (GCS/S3)
+- **Serverless-friendly** - $0-$5/month on object storage (GCS/S3 coming soon)
 - **Zero infrastructure** - No databases, no clusters to maintain
 - **Automatic lineage capture** - Track data flow through transformations
-- **Full-text search** - Find datasets quickly with SQLite FTS5
+- **Full-text search with FTS5** - Fast search with automatic trigger maintenance
+- **Optimistic concurrency** - Safe concurrent writes with version-based locking
 - **Tags and glossary** - Organize with business context
+- **Operational metadata** - Track row counts, sizes, partition keys
 
 MetaFuse fills the gap between expensive, complex enterprise catalogs (DataHub, Collibra) and the needs of small-to-medium data teams.
 
@@ -41,16 +43,27 @@ cargo build --release
 
 ```rust
 use datafusion::prelude::*;
+use metafuse_catalog_core::OperationalMeta;
 use metafuse_catalog_emitter::Emitter;
 use metafuse_catalog_storage::LocalSqliteBackend;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> datafusion::error::Result<()> {
     let ctx = SessionContext::new();
     let df = ctx.read_parquet("input.parquet", Default::default()).await?;
     let result = df.filter(col("status").eq(lit("active")))?.select_columns(&["id", "name"])?;
 
-    result.write_parquet("output.parquet", Default::default()).await?;
+    // Get schema and row count before writing
+    let schema = result.schema().inner().clone();
+    let batches = result.collect().await?;
+    let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+    // Write output
+    ctx.register_batches("active_records", batches.clone())?;
+    ctx.sql("SELECT * FROM active_records")
+        .await?
+        .write_parquet("output.parquet", Default::default())
+        .await?;
 
     // Emit metadata to catalog
     let backend = LocalSqliteBackend::new("metafuse_catalog.db");
@@ -59,14 +72,18 @@ async fn main() -> Result<()> {
         "active_records",
         "output.parquet",
         "parquet",
-        Some("Filtered active records"),
-        Some("prod"),
-        Some("analytics"),
-        Some("team@example.com"),
-        result.schema().inner().clone(),
-        None,
-        vec!["raw_records"],  // Upstream
-        vec!["active"],       // Tags
+        Some("Filtered active records"),  // Description
+        Some("prod"),                       // Tenant
+        Some("analytics"),                  // Domain
+        Some("team@example.com"),          // Owner
+        schema,                            // Arrow schema
+        Some(OperationalMeta {
+            row_count: Some(row_count as i64),
+            size_bytes: None,
+            partition_keys: vec![],
+        }),
+        vec!["raw_records".to_string()],   // Upstream lineage
+        vec!["active".to_string()],        // Tags
     )?;
 
     Ok(())
@@ -99,6 +116,18 @@ curl http://localhost:8080/api/v1/datasets
 curl http://localhost:8080/api/v1/datasets/active_records
 curl "http://localhost:8080/api/v1/search?q=analytics"
 ```
+
+### Try the Examples
+
+```bash
+# Simple pipeline - basic metadata emission
+cargo run --example simple_pipeline
+
+# Lineage tracking - 3-stage ETL with dependencies
+cargo run --example lineage_tracking
+```
+
+See [examples/README.md](examples/README.md) for detailed walkthrough and expected output.
 
 ## Documentation
 

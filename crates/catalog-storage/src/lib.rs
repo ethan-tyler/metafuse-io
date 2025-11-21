@@ -8,6 +8,7 @@ use rusqlite::Connection;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(any(feature = "gcs", feature = "s3"))]
 use tempfile::NamedTempFile;
 
 /// Convenience alias for trait objects.
@@ -162,6 +163,7 @@ pub fn backend_from_uri(uri: &str) -> Result<Box<dyn CatalogBackend>> {
             }
             #[cfg(not(feature = "gcs"))]
             {
+                let _ = (bucket, object);
                 Err(CatalogError::Other(
                     "GCS backend requires the 'gcs' feature. Rebuild with --features gcs".into(),
                 ))
@@ -182,6 +184,7 @@ pub fn backend_from_uri(uri: &str) -> Result<Box<dyn CatalogBackend>> {
             }
             #[cfg(not(feature = "s3"))]
             {
+                let _ = (bucket, key, region);
                 Err(CatalogError::Other(
                     "S3 backend requires the 's3' feature. Rebuild with --features s3".into(),
                 ))

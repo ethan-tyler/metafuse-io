@@ -55,9 +55,13 @@ serde_json = "1"
 # Testing
 tempfile = "3"
 
+# Benchmarking
+criterion = { version = "0.5", features = ["html_reports"] }
+
 [dev-dependencies]
 tempfile = "3"
 serde_json.workspace = true
+criterion.workspace = true
 
 # Package dependencies for examples
 [dependencies]
@@ -67,6 +71,10 @@ metafuse-catalog-storage = { path = "crates/catalog-storage" }
 datafusion.workspace = true
 tokio.workspace = true
 
+# Features
+[features]
+bench = []
+
 # Examples
 [[example]]
 name = "simple_pipeline"
@@ -75,3 +83,10 @@ path = "examples/simple_pipeline.rs"
 [[example]]
 name = "lineage_tracking"
 path = "examples/lineage_tracking.rs"
+
+# Benchmarks
+[[bench]]
+name = "emitter_benchmarks"
+path = "benches/emitter_benchmarks.rs"
+harness = false
+required-features = ["bench"]

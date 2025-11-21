@@ -59,34 +59,61 @@ Each backend handles:
 
 ### 3. Optimistic Concurrency Control
 
-MetaFuse uses a version counter in the `catalog_meta` table:
+MetaFuse uses a version counter in the `catalog_meta` table to safely handle concurrent writes without distributed locks or coordination servers.
 
-1. **Read**: Download catalog + current version number
-2. **Modify**: Make changes in local SQLite
-3. **Write**: Upload only if remote version matches expected version
-4. **Retry**: If version mismatch, re-download and retry
+**Write Flow:**
+
+1. **Download**: Backend downloads catalog file from storage
+2. **Read version**: Extract current version from `catalog_meta` table
+3. **Modify**: Make changes to local SQLite database (insert/update/delete)
+4. **Increment version**: Atomically increment version in same transaction
+5. **Upload with precondition**: Upload new catalog file only if remote version matches expected version
+6. **Retry on conflict**: If version mismatch detected, re-download catalog and retry from step 1
+
+**Implementation:**
 
 ```rust
-// Pseudocode for write operation
-let current_version = read_version_from_remote();
-    let connection = backend.get_connection()?;
+// catalog-core/src/lib.rs
+pub fn get_catalog_version(conn: &rusqlite::Connection) -> Result<i64> {
+    conn.query_row("SELECT version FROM catalog_meta", [], |row| row.get(0))
+        .map_err(|e| CatalogError::DatabaseError(e.to_string()))
+}
 
-// Make changes...
-connection.execute("UPDATE datasets SET ...")?;
-
-// Increment version
-let new_version = current_version + 1;
-connection.execute("UPDATE catalog_meta SET version = ?", [new_version])?;
-
-// Upload with precondition: version == current_version
-backend.upload_if_version_matches(current_version)?;
+pub fn increment_catalog_version(conn: &rusqlite::Connection) -> Result<i64> {
+    conn.execute("UPDATE catalog_meta SET version = version + 1", [])?;
+    get_catalog_version(conn)
+}
 ```
 
-This approach:
+**Backend-Specific Concurrency:**
+
+| Backend | Mechanism | Conflict Detection |
+|---------|-----------|-------------------|
+| **Local** | File-based version check | Version column in catalog_meta |
+| **GCS** (future) | Object generation numbers | If-Generation-Match precondition |
+| **S3** (future) | ETag versioning | If-Match precondition header |
+
+**Example Scenario:**
+
+1. Writer A downloads catalog at version 10
+2. Writer B downloads catalog at version 10
+3. Writer A completes changes, increments to v11, uploads successfully
+4. Writer B completes changes, tries to upload with precondition "version=10"
+5. Upload fails (remote is now v11), Writer B re-downloads and retries
+
+**Benefits:**
+
 - Prevents lost updates without distributed locks
-- Allows concurrent reads without contention
-- Retries automatically on write conflicts
-- Works across cloud backends (GCS generations, S3 ETags)
+- Allows unlimited concurrent reads without contention
+- Automatic retry with exponential backoff on conflicts
+- Works consistently across all storage backends
+- No coordination server or consensus protocol needed
+
+**Trade-offs:**
+
+- Write throughput limited by retry overhead under high contention
+- Not suitable for >100 concurrent writers
+- Requires retry logic in emitter code
 
 ### 4. Schema Design
 
@@ -103,13 +130,55 @@ The SQLite schema is optimized for read-heavy workloads:
 
 **Search Optimization:**
 - `dataset_search`: FTS5 virtual table for full-text search
-- Automatic triggers keep FTS index in sync
-- Supports searching across name, path, domain, field names
+- Automatic triggers keep FTS index in sync (detailed below)
+- Supports searching across name, path, domain, owner, description, tags, and field names
 
 **Indexes:**
 - Primary keys on all tables
 - Foreign key indexes for efficient joins
 - Unique constraints on dataset names (per tenant)
+
+#### Full-Text Search with Automatic Trigger Maintenance
+
+MetaFuse uses SQLite's FTS5 (Full-Text Search) extension for fast dataset discovery. The `dataset_search` FTS5 virtual table mirrors content from the `datasets`, `tags`, and `fields` tables.
+
+**Trigger Architecture:**
+
+Six SQLite triggers automatically maintain the FTS index:
+
+1. **`dataset_search_insert`** - When a dataset is inserted, create FTS entry
+2. **`dataset_search_update`** - When a dataset is updated, refresh FTS entry
+3. **`dataset_search_delete`** - When a dataset is deleted, remove from FTS
+4. **`dataset_search_fields_update`** - When fields are added, refresh parent dataset's FTS entry
+5. **`dataset_search_fields_delete`** - When fields are deleted, refresh parent dataset's FTS entry
+6. **`dataset_search_tags_insert`** - When tags are added, refresh parent dataset's FTS entry
+7. **`dataset_search_tags_delete`** - When tags are deleted, refresh parent dataset's FTS entry
+
+**Example Trigger:**
+
+```sql
+CREATE TRIGGER dataset_search_insert
+AFTER INSERT ON datasets
+BEGIN
+  INSERT INTO dataset_search (dataset_name, path, domain, owner, description, tags, field_names)
+  VALUES (
+    NEW.name,
+    NEW.path,
+    NEW.domain,
+    NEW.owner,
+    NEW.description,
+    COALESCE((SELECT GROUP_CONCAT(tag, ' ') FROM tags WHERE dataset_id = NEW.id), ''),
+    COALESCE((SELECT GROUP_CONCAT(name, ' ') FROM fields WHERE dataset_id = NEW.id), '')
+  );
+END;
+```
+
+**Benefits:**
+
+- Zero-maintenance search - developers never manually update the FTS index
+- Always consistent - triggers execute atomically within transactions
+- High performance - FTS5 uses advanced ranking algorithms (BM25)
+- Flexible queries - Support for AND/OR/NOT operators, phrase matching, prefix search
 
 ### 5. DataFusion Integration
 

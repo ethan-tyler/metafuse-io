@@ -137,16 +137,17 @@ fn list_datasets(
 
     let datasets = stmt.query_map(param_refs.as_slice(), |row| {
         Ok((
-            row.get::<_, String>(0)?,         // name
-            row.get::<_, String>(1)?,         // path
-            row.get::<_, String>(2)?,         // format
-            row.get::<_, Option<String>>(3)?, // description
-            row.get::<_, Option<String>>(4)?, // tenant
-            row.get::<_, Option<String>>(5)?, // domain
-            row.get::<_, Option<String>>(6)?, // owner
-            row.get::<_, String>(7)?,         // last_updated
-            row.get::<_, Option<i64>>(8)?,    // row_count
-            row.get::<_, Option<i64>>(9)?,    // size_bytes
+            row.get::<_, String>(0)?,          // name
+            row.get::<_, String>(1)?,          // path
+            row.get::<_, String>(2)?,          // format
+            row.get::<_, Option<String>>(3)?,  // description
+            row.get::<_, Option<String>>(4)?,  // tenant
+            row.get::<_, Option<String>>(5)?,  // domain
+            row.get::<_, Option<String>>(6)?,  // owner
+            row.get::<_, String>(7)?,          // last_updated
+            row.get::<_, Option<i64>>(8)?,     // row_count
+            row.get::<_, Option<i64>>(9)?,     // size_bytes
+            row.get::<_, Option<String>>(10)?, // partition keys JSON
         ))
     })?;
 
@@ -165,6 +166,7 @@ fn list_datasets(
             last_updated,
             row_count,
             size_bytes,
+            partition_keys_json,
         ) = dataset?;
 
         if verbose {
@@ -190,6 +192,13 @@ fn list_datasets(
             if let Some(sb) = size_bytes {
                 println!("  Size: {}", format_bytes(sb));
             }
+            if let Some(pk_json) = partition_keys_json {
+                if let Ok(keys) = serde_json::from_str::<Vec<String>>(&pk_json) {
+                    if !keys.is_empty() {
+                        println!("  Partitions: {}", keys.join(", "));
+                    }
+                }
+            }
             println!();
         } else {
             print!("  {} ({})", name, format);
@@ -213,7 +222,7 @@ fn show_dataset(
 
     // Get dataset info
     let dataset: Result<_, rusqlite::Error> = conn.query_row(
-        "SELECT name, path, format, description, tenant, domain, owner, created_at, last_updated, row_count, size_bytes FROM datasets WHERE name = ?1",
+        "SELECT name, path, format, description, tenant, domain, owner, created_at, last_updated, row_count, size_bytes, partition_keys FROM datasets WHERE name = ?1",
         [name],
         |row| {
             Ok((
@@ -228,6 +237,7 @@ fn show_dataset(
                 row.get::<_, String>(8)?,
                 row.get::<_, Option<i64>>(9)?,
                 row.get::<_, Option<i64>>(10)?,
+                row.get::<_, Option<String>>(11)?,
             ))
         },
     );
@@ -244,6 +254,7 @@ fn show_dataset(
         last_updated,
         row_count,
         size_bytes,
+        partition_keys_json,
     ) = dataset?;
 
     println!("Dataset: {}", name);
@@ -268,6 +279,13 @@ fn show_dataset(
     }
     if let Some(sb) = size_bytes {
         println!("Size: {}", format_bytes(sb));
+    }
+    if let Some(pk_json) = partition_keys_json {
+        if let Ok(keys) = serde_json::from_str::<Vec<String>>(&pk_json) {
+            if !keys.is_empty() {
+                println!("Partitions: {}", keys.join(", "));
+            }
+        }
     }
 
     // Get fields

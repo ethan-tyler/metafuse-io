@@ -42,8 +42,7 @@ struct DatasetResponse {
     owner: Option<String>,
     created_at: String,
     last_updated: String,
-    row_count: Option<i64>,
-    size_bytes: Option<i64>,
+    operational: OperationalMetaResponse,
 }
 
 /// Field response structure
@@ -66,6 +65,13 @@ struct DatasetDetailResponse {
     downstream_datasets: Vec<String>,
 }
 
+/// Operational metadata response
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct OperationalMetaResponse {
+    row_count: Option<i64>,
+    size_bytes: Option<i64>,
+    partition_keys: Vec<String>,
+}
 /// Error response
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
@@ -147,7 +153,7 @@ async fn list_datasets(
     let mut query = String::from(
         r#"
         SELECT id, name, path, format, description, tenant, domain, owner,
-               created_at, last_updated, row_count, size_bytes
+               created_at, last_updated, row_count, size_bytes, partition_keys
         FROM datasets
         WHERE 1=1
         "#,
@@ -173,6 +179,9 @@ async fn list_datasets(
 
     let datasets = stmt
         .query_map(params_from_iter(bindings.iter()), |row| {
+            let row_count: Option<i64> = row.get(10)?;
+            let size_bytes: Option<i64> = row.get(11)?;
+            let partition_keys = parse_partition_keys(row.get::<_, Option<String>>(12)?);
             Ok(DatasetResponse {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -184,8 +193,11 @@ async fn list_datasets(
                 owner: row.get(7)?,
                 created_at: row.get(8)?,
                 last_updated: row.get(9)?,
-                row_count: row.get(10)?,
-                size_bytes: row.get(11)?,
+                operational: OperationalMetaResponse {
+                    row_count,
+                    size_bytes,
+                    partition_keys,
+                },
             })
         })
         .map_err(|e| internal_error(e.to_string()))?
@@ -209,13 +221,16 @@ async fn get_dataset(
     let dataset: DatasetResponse = conn
         .query_row(
             r#"
-            SELECT id, name, path, format, description, tenant, domain, owner,
-                   created_at, last_updated, row_count, size_bytes
-            FROM datasets
-            WHERE name = ?1
-            "#,
+        SELECT id, name, path, format, description, tenant, domain, owner,
+               created_at, last_updated, row_count, size_bytes, partition_keys
+        FROM datasets
+        WHERE name = ?1
+        "#,
             [&name],
             |row| {
+                let row_count: Option<i64> = row.get(10)?;
+                let size_bytes: Option<i64> = row.get(11)?;
+                let partition_keys = parse_partition_keys(row.get::<_, Option<String>>(12)?);
                 Ok(DatasetResponse {
                     id: row.get(0)?,
                     name: row.get(1)?,
@@ -227,8 +242,11 @@ async fn get_dataset(
                     owner: row.get(7)?,
                     created_at: row.get(8)?,
                     last_updated: row.get(9)?,
-                    row_count: row.get(10)?,
-                    size_bytes: row.get(11)?,
+                    operational: OperationalMetaResponse {
+                        row_count,
+                        size_bytes,
+                        partition_keys,
+                    },
                 })
             },
         )
@@ -326,7 +344,7 @@ async fn search_datasets(
         .prepare(
             r#"
             SELECT d.id, d.name, d.path, d.format, d.description, d.tenant, d.domain, d.owner,
-                   d.created_at, d.last_updated, d.row_count, d.size_bytes
+                   d.created_at, d.last_updated, d.row_count, d.size_bytes, d.partition_keys
             FROM datasets d
             JOIN dataset_search s ON d.name = s.dataset_name
             WHERE dataset_search MATCH ?1
@@ -337,6 +355,9 @@ async fn search_datasets(
 
     let datasets = stmt
         .query_map([query], |row| {
+            let row_count: Option<i64> = row.get(10)?;
+            let size_bytes: Option<i64> = row.get(11)?;
+            let partition_keys = parse_partition_keys(row.get::<_, Option<String>>(12)?);
             Ok(DatasetResponse {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -348,8 +369,11 @@ async fn search_datasets(
                 owner: row.get(7)?,
                 created_at: row.get(8)?,
                 last_updated: row.get(9)?,
-                row_count: row.get(10)?,
-                size_bytes: row.get(11)?,
+                operational: OperationalMetaResponse {
+                    row_count,
+                    size_bytes,
+                    partition_keys,
+                },
             })
         })
         .map_err(|e| internal_error(e.to_string()))?
@@ -381,4 +405,9 @@ fn bad_request(message: String) -> (StatusCode, Json<ErrorResponse>) {
         StatusCode::BAD_REQUEST,
         Json(ErrorResponse { error: message }),
     )
+}
+
+fn parse_partition_keys(raw: Option<String>) -> Vec<String> {
+    raw.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default()
 }
