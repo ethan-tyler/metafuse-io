@@ -9,6 +9,13 @@ members = [
 
 resolver = "2"
 
+# Virtual workspace package for examples
+[package]
+name = "metafuse-examples"
+version.workspace = true
+edition.workspace = true
+publish = false
+
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"
@@ -47,3 +54,23 @@ serde_json = "1"
 
 # Testing
 tempfile = "3"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Package dependencies for examples
+[dependencies]
+metafuse-catalog-core = { path = "crates/catalog-core" }
+metafuse-catalog-emitter = { path = "crates/catalog-emitter" }
+metafuse-catalog-storage = { path = "crates/catalog-storage" }
+datafusion.workspace = true
+tokio.workspace = true
+
+# Examples
+[[example]]
+name = "simple_pipeline"
+path = "examples/simple_pipeline.rs"
+
+[[example]]
+name = "lineage_tracking"
+path = "examples/lineage_tracking.rs"

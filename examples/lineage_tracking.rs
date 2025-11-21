@@ -12,6 +12,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::Result;
 use datafusion::prelude::*;
+use metafuse_catalog_core::OperationalMeta;
 use metafuse_catalog_emitter::Emitter;
 use metafuse_catalog_storage::LocalSqliteBackend;
 use std::sync::Arc;
@@ -86,8 +87,12 @@ async fn main() -> Result<()> {
         Some("sales"),
         Some("data-ingestion@example.com"),
         raw_schema,
-        Some(raw_batch.num_rows() as i64),
-        vec![],  // No upstream dependencies
+        Some(OperationalMeta {
+            row_count: Some(raw_batch.num_rows() as i64),
+            size_bytes: None,
+            partition_keys: vec![],
+        }),
+        vec![], // No upstream dependencies
         vec!["raw".to_string(), "transactions".to_string()],
     )?;
     println!("  Metadata emitted: raw_transactions\n");
@@ -105,9 +110,11 @@ async fn main() -> Result<()> {
         )
         .await?;
 
+    // Get the schema before consuming the DataFrame
+    let cleaned_schema = cleaned_df.schema().inner().clone();
+
     let cleaned_result = cleaned_df.collect().await?;
     let cleaned_count: usize = cleaned_result.iter().map(|b| b.num_rows()).sum();
-    let cleaned_schema = cleaned_df.schema().inner().clone();
 
     println!(
         "  Cleaned {} transactions (removed {} invalid)",
@@ -125,8 +132,12 @@ async fn main() -> Result<()> {
         Some("sales"),
         Some("data-pipeline@example.com"),
         cleaned_schema,
-        Some(cleaned_count as i64),
-        vec!["raw_transactions".to_string()],  // Upstream dependency
+        Some(OperationalMeta {
+            row_count: Some(cleaned_count as i64),
+            size_bytes: None,
+            partition_keys: vec![],
+        }),
+        vec!["raw_transactions".to_string()], // Upstream dependency
         vec!["cleaned".to_string(), "validated".to_string()],
     )?;
     println!("  Metadata emitted: cleaned_transactions");
@@ -156,9 +167,11 @@ async fn main() -> Result<()> {
         )
         .await?;
 
+    // Get the schema before consuming the DataFrame
+    let summary_schema = summary_df.schema().inner().clone();
+
     let summary_result = summary_df.collect().await?;
     let summary_count: usize = summary_result.iter().map(|b| b.num_rows()).sum();
-    let summary_schema = summary_df.schema().inner().clone();
 
     println!("  Aggregated {} customer summaries", summary_count);
 
@@ -172,9 +185,17 @@ async fn main() -> Result<()> {
         Some("sales"),
         Some("analytics@example.com"),
         summary_schema,
-        Some(summary_count as i64),
-        vec!["cleaned_transactions".to_string()],  // Upstream dependency
-        vec!["aggregated".to_string(), "summary".to_string(), "daily".to_string()],
+        Some(OperationalMeta {
+            row_count: Some(summary_count as i64),
+            size_bytes: None,
+            partition_keys: vec![],
+        }),
+        vec!["cleaned_transactions".to_string()], // Upstream dependency
+        vec![
+            "aggregated".to_string(),
+            "summary".to_string(),
+            "daily".to_string(),
+        ],
     )?;
     println!("  Metadata emitted: daily_summary");
     println!("  Lineage: cleaned_transactions -> daily_summary\n");

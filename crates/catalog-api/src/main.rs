@@ -8,7 +8,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use metafuse_catalog_storage::{CatalogBackend, LocalSqliteBackend};
+use metafuse_catalog_storage::{backend_from_uri, DynCatalogBackend};
 use rusqlite::params_from_iter;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -17,11 +17,11 @@ use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 /// Application state shared across handlers
-struct AppState<B: CatalogBackend> {
-    backend: Arc<B>,
+struct AppState {
+    backend: Arc<DynCatalogBackend>,
 }
 
-impl<B: CatalogBackend> Clone for AppState<B> {
+impl Clone for AppState {
     fn clone(&self) -> Self {
         Self {
             backend: Arc::clone(&self.backend),
@@ -88,16 +88,22 @@ async fn main() {
 
     tracing::info!("Using catalog at: {}", catalog_path);
 
-    let backend = LocalSqliteBackend::new(&catalog_path);
+    let backend = backend_from_uri(&catalog_path).unwrap_or_else(|e| {
+        tracing::error!("Failed to create backend: {}", e);
+        std::process::exit(1);
+    });
 
-    // Check if catalog exists
-    if !backend.exists().unwrap_or(false) {
+    // Check if catalog exists for local backends
+    if let Ok(false) = backend.exists() {
         tracing::warn!("Catalog does not exist, initializing new catalog");
-        backend.initialize().expect("Failed to initialize catalog");
+        if let Err(e) = backend.initialize() {
+            tracing::error!("Failed to initialize catalog: {}", e);
+            std::process::exit(1);
+        }
     }
 
     let state = AppState {
-        backend: Arc::new(backend),
+        backend: Arc::from(backend),
     };
 
     // Build router
@@ -129,8 +135,8 @@ async fn health_check() -> &'static str {
 }
 
 /// List all datasets
-async fn list_datasets<B: CatalogBackend>(
-    State(state): State<AppState<B>>,
+async fn list_datasets(
+    State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<DatasetResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let conn = state
@@ -190,8 +196,8 @@ async fn list_datasets<B: CatalogBackend>(
 }
 
 /// Get a specific dataset by name
-async fn get_dataset<B: CatalogBackend>(
-    State(state): State<AppState<B>>,
+async fn get_dataset(
+    State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<DatasetDetailResponse>, (StatusCode, Json<ErrorResponse>)> {
     let conn = state
@@ -303,8 +309,8 @@ async fn get_dataset<B: CatalogBackend>(
 }
 
 /// Search datasets using FTS
-async fn search_datasets<B: CatalogBackend>(
-    State(state): State<AppState<B>>,
+async fn search_datasets(
+    State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<DatasetResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let query = params

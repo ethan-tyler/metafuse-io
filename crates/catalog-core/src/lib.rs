@@ -26,16 +26,25 @@ pub struct DatasetMeta {
     pub created_at: DateTime<Utc>,
     /// When the dataset metadata was last updated
     pub last_updated: DateTime<Utc>,
-    /// Approximate number of rows (if available)
-    pub row_count: Option<i64>,
-    /// Size in bytes (if available)
-    pub size_bytes: Option<i64>,
     /// Schema fields
     pub fields: Vec<FieldMeta>,
     /// Names of upstream datasets this depends on
     pub upstream_datasets: Vec<String>,
     /// Tags for categorization and discovery
     pub tags: Vec<String>,
+    /// Operational metadata (row counts, size, partitions)
+    pub operational: Option<OperationalMeta>,
+}
+
+/// Operational metadata about a dataset
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationalMeta {
+    /// Approximate number of rows
+    pub row_count: Option<i64>,
+    /// Size in bytes
+    pub size_bytes: Option<i64>,
+    /// Partition column names (if partitioned)
+    pub partition_keys: Vec<String>,
 }
 
 /// Metadata for a field/column in a dataset
@@ -70,6 +79,13 @@ pub enum CatalogError {
     Other(String),
 }
 
+// Enable conversion to DataFusionError for seamless integration
+impl From<CatalogError> for datafusion::error::DataFusionError {
+    fn from(err: CatalogError) -> Self {
+        datafusion::error::DataFusionError::External(Box::new(err))
+    }
+}
+
 /// Result type for catalog operations
 pub type Result<T> = std::result::Result<T, CatalogError>;
 
@@ -88,11 +104,13 @@ pub fn init_sqlite_schema(conn: &rusqlite::Connection) -> Result<()> {
     let ddl = r#"
     -- Version control for optimistic concurrency
     CREATE TABLE IF NOT EXISTS catalog_meta (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      version INTEGER NOT NULL DEFAULT 1,
+      last_modified TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
-    INSERT OR IGNORE INTO catalog_meta (key, value) VALUES ('version', '1');
+    INSERT OR IGNORE INTO catalog_meta (id, version, last_modified)
+    VALUES (1, 1, datetime('now'));
 
     -- Core dataset registry
     CREATE TABLE IF NOT EXISTS datasets (
@@ -107,7 +125,8 @@ pub fn init_sqlite_schema(conn: &rusqlite::Connection) -> Result<()> {
       created_at TEXT NOT NULL,
       last_updated TEXT NOT NULL,
       row_count INTEGER,
-      size_bytes INTEGER
+      size_bytes INTEGER,
+      partition_keys TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_datasets_tenant ON datasets(tenant);
@@ -191,6 +210,113 @@ pub fn init_sqlite_schema(conn: &rusqlite::Connection) -> Result<()> {
       tags,
       field_names
     );
+
+    -- Triggers to maintain FTS index automatically
+    -- When a dataset is inserted, add to FTS
+    CREATE TRIGGER IF NOT EXISTS dataset_search_insert
+    AFTER INSERT ON datasets
+    BEGIN
+      INSERT INTO dataset_search (dataset_name, path, domain, owner, description, tags, field_names)
+      VALUES (
+        NEW.name,
+        NEW.path,
+        NEW.domain,
+        NEW.owner,
+        NEW.description,
+        COALESCE((SELECT GROUP_CONCAT(tag, ' ') FROM tags WHERE dataset_id = NEW.id), ''),
+        COALESCE((SELECT GROUP_CONCAT(name, ' ') FROM fields WHERE dataset_id = NEW.id), '')
+      );
+    END;
+
+    -- When a dataset is updated, refresh FTS entry
+    CREATE TRIGGER IF NOT EXISTS dataset_search_update
+    AFTER UPDATE ON datasets
+    BEGIN
+      DELETE FROM dataset_search WHERE dataset_name = OLD.name;
+      INSERT INTO dataset_search (dataset_name, path, domain, owner, description, tags, field_names)
+      VALUES (
+        NEW.name,
+        NEW.path,
+        NEW.domain,
+        NEW.owner,
+        NEW.description,
+        COALESCE((SELECT GROUP_CONCAT(tag, ' ') FROM tags WHERE dataset_id = NEW.id), ''),
+        COALESCE((SELECT GROUP_CONCAT(name, ' ') FROM fields WHERE dataset_id = NEW.id), '')
+      );
+    END;
+
+    -- When a dataset is deleted, remove from FTS
+    CREATE TRIGGER IF NOT EXISTS dataset_search_delete
+    AFTER DELETE ON datasets
+    BEGIN
+      DELETE FROM dataset_search WHERE dataset_name = OLD.name;
+    END;
+
+    -- When fields are modified, refresh the parent dataset's FTS entry
+    CREATE TRIGGER IF NOT EXISTS dataset_search_fields_update
+    AFTER INSERT ON fields
+    BEGIN
+      DELETE FROM dataset_search WHERE dataset_name = (SELECT name FROM datasets WHERE id = NEW.dataset_id);
+      INSERT INTO dataset_search (dataset_name, path, domain, owner, description, tags, field_names)
+      SELECT
+        d.name,
+        d.path,
+        d.domain,
+        d.owner,
+        d.description,
+        COALESCE((SELECT GROUP_CONCAT(tag, ' ') FROM tags WHERE dataset_id = d.id), ''),
+        COALESCE((SELECT GROUP_CONCAT(name, ' ') FROM fields WHERE dataset_id = d.id), '')
+      FROM datasets d WHERE d.id = NEW.dataset_id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS dataset_search_fields_delete
+    AFTER DELETE ON fields
+    BEGIN
+      DELETE FROM dataset_search WHERE dataset_name = (SELECT name FROM datasets WHERE id = OLD.dataset_id);
+      INSERT INTO dataset_search (dataset_name, path, domain, owner, description, tags, field_names)
+      SELECT
+        d.name,
+        d.path,
+        d.domain,
+        d.owner,
+        d.description,
+        COALESCE((SELECT GROUP_CONCAT(tag, ' ') FROM tags WHERE dataset_id = d.id), ''),
+        COALESCE((SELECT GROUP_CONCAT(name, ' ') FROM fields WHERE dataset_id = d.id), '')
+      FROM datasets d WHERE d.id = OLD.dataset_id;
+    END;
+
+    -- When tags are modified, refresh the parent dataset's FTS entry
+    CREATE TRIGGER IF NOT EXISTS dataset_search_tags_insert
+    AFTER INSERT ON tags
+    BEGIN
+      DELETE FROM dataset_search WHERE dataset_name = (SELECT name FROM datasets WHERE id = NEW.dataset_id);
+      INSERT INTO dataset_search (dataset_name, path, domain, owner, description, tags, field_names)
+      SELECT
+        d.name,
+        d.path,
+        d.domain,
+        d.owner,
+        d.description,
+        COALESCE((SELECT GROUP_CONCAT(tag, ' ') FROM tags WHERE dataset_id = d.id), ''),
+        COALESCE((SELECT GROUP_CONCAT(name, ' ') FROM fields WHERE dataset_id = d.id), '')
+      FROM datasets d WHERE d.id = NEW.dataset_id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS dataset_search_tags_delete
+    AFTER DELETE ON tags
+    BEGIN
+      DELETE FROM dataset_search WHERE dataset_name = (SELECT name FROM datasets WHERE id = OLD.dataset_id);
+      INSERT INTO dataset_search (dataset_name, path, domain, owner, description, tags, field_names)
+      SELECT
+        d.name,
+        d.path,
+        d.domain,
+        d.owner,
+        d.description,
+        COALESCE((SELECT GROUP_CONCAT(tag, ' ') FROM tags WHERE dataset_id = d.id), ''),
+        COALESCE((SELECT GROUP_CONCAT(name, ' ') FROM fields WHERE dataset_id = d.id), '')
+      FROM datasets d WHERE d.id = OLD.dataset_id;
+    END;
     "#;
 
     conn.execute_batch(ddl)?;
@@ -199,24 +325,33 @@ pub fn init_sqlite_schema(conn: &rusqlite::Connection) -> Result<()> {
 
 /// Get the current catalog version for optimistic concurrency control
 pub fn get_catalog_version(conn: &rusqlite::Connection) -> Result<i64> {
-    let version: String = conn.query_row(
-        "SELECT value FROM catalog_meta WHERE key = 'version'",
-        [],
-        |row| row.get(0),
-    )?;
-
-    version
-        .parse()
-        .map_err(|e| CatalogError::Other(format!("Invalid version format: {}", e)))
+    let version: i64 =
+        conn.query_row("SELECT version FROM catalog_meta WHERE id = 1", [], |row| {
+            row.get(0)
+        })?;
+    Ok(version)
 }
 
 /// Increment the catalog version (call after successful write)
 pub fn increment_catalog_version(conn: &rusqlite::Connection) -> Result<i64> {
     conn.execute(
-        "UPDATE catalog_meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'version'",
+        "UPDATE catalog_meta SET version = version + 1, last_modified = datetime('now') WHERE id = 1",
         [],
     )?;
     get_catalog_version(conn)
+}
+
+/// Update the catalog version to a specific value (used for optimistic locking validation)
+pub fn set_catalog_version(
+    conn: &rusqlite::Connection,
+    expected_version: i64,
+    new_version: i64,
+) -> Result<bool> {
+    let rows_affected = conn.execute(
+        "UPDATE catalog_meta SET version = ?2, last_modified = datetime('now') WHERE id = 1 AND version = ?1",
+        [expected_version, new_version],
+    )?;
+    Ok(rows_affected > 0)
 }
 
 #[cfg(test)]
@@ -254,5 +389,119 @@ mod tests {
 
         let new_version = increment_catalog_version(&conn).unwrap();
         assert_eq!(new_version, 2);
+    }
+
+    #[test]
+    fn test_fts_triggers() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_sqlite_schema(&conn).unwrap();
+
+        // Insert a dataset - trigger should create FTS entry
+        conn.execute(
+            "INSERT INTO datasets (name, path, format, description, domain, owner, created_at, last_updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now'))",
+            rusqlite::params![
+                "test_dataset",
+                "/data/test.parquet",
+                "parquet",
+                "A test dataset",
+                "analytics",
+                "test@example.com"
+            ],
+        )
+        .unwrap();
+
+        let dataset_id: i64 = conn
+            .query_row(
+                "SELECT id FROM datasets WHERE name = ?1",
+                ["test_dataset"],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // Verify FTS entry was created by trigger
+        let fts_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dataset_search WHERE dataset_name = ?1",
+                ["test_dataset"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_count, 1);
+
+        // Add fields - trigger should update FTS with field_names
+        conn.execute(
+            "INSERT INTO fields (dataset_id, name, data_type, nullable) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![dataset_id, "id", "Int64", 0],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fields (dataset_id, name, data_type, nullable) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![dataset_id, "name", "Utf8", 1],
+        )
+        .unwrap();
+
+        // Verify FTS entry contains field_names
+        let field_names: String = conn
+            .query_row(
+                "SELECT field_names FROM dataset_search WHERE dataset_name = ?1",
+                ["test_dataset"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(field_names.contains("id"));
+        assert!(field_names.contains("name"));
+
+        // Add tags - trigger should update FTS with tags
+        conn.execute(
+            "INSERT INTO tags (dataset_id, tag) VALUES (?1, ?2)",
+            rusqlite::params![dataset_id, "production"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tags (dataset_id, tag) VALUES (?1, ?2)",
+            rusqlite::params![dataset_id, "daily"],
+        )
+        .unwrap();
+
+        // Verify FTS entry contains tags
+        let tags: String = conn
+            .query_row(
+                "SELECT tags FROM dataset_search WHERE dataset_name = ?1",
+                ["test_dataset"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(tags.contains("production"));
+        assert!(tags.contains("daily"));
+
+        // Update dataset - trigger should refresh FTS entry
+        conn.execute(
+            "UPDATE datasets SET description = ?1 WHERE id = ?2",
+            rusqlite::params!["Updated description", dataset_id],
+        )
+        .unwrap();
+
+        let description: String = conn
+            .query_row(
+                "SELECT description FROM dataset_search WHERE dataset_name = ?1",
+                ["test_dataset"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(description, "Updated description");
+
+        // Delete dataset - trigger should remove FTS entry
+        conn.execute("DELETE FROM datasets WHERE id = ?1", [dataset_id])
+            .unwrap();
+
+        let fts_count_after_delete: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dataset_search WHERE dataset_name = ?1",
+                ["test_dataset"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_count_after_delete, 0);
     }
 }

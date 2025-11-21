@@ -12,6 +12,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::Result;
 use datafusion::prelude::*;
+use metafuse_catalog_core::OperationalMeta;
 use metafuse_catalog_emitter::Emitter;
 use metafuse_catalog_storage::LocalSqliteBackend;
 use std::sync::Arc;
@@ -53,7 +54,11 @@ async fn main() -> Result<()> {
         ],
     )?;
 
-    println!("   Created {} rows with {} columns", batch.num_rows(), batch.num_columns());
+    println!(
+        "   Created {} rows with {} columns",
+        batch.num_rows(),
+        batch.num_columns()
+    );
 
     // Step 2: Create DataFusion context and register data
     println!("\n2. Running DataFusion query...");
@@ -65,12 +70,15 @@ async fn main() -> Result<()> {
         .sql("SELECT id, name, value FROM source_data WHERE value > 150.0")
         .await?;
 
+    // Get the schema before consuming the DataFrame
+    let result_schema = df.schema().inner().clone();
+
     let result = df.collect().await?;
     let row_count: usize = result.iter().map(|batch| batch.num_rows()).sum();
-    println!("   Query returned {} rows (filtered value > 150.0)", row_count);
-
-    // Get the schema for metadata emission
-    let result_schema = df.schema().inner().clone();
+    println!(
+        "   Query returned {} rows (filtered value > 150.0)",
+        row_count
+    );
 
     // Step 3: Emit metadata to catalog
     println!("\n3. Emitting metadata to catalog...");
@@ -86,8 +94,12 @@ async fn main() -> Result<()> {
         Some("analytics"),
         Some("example@metafuse.dev"),
         result_schema,
-        Some(row_count as i64),
-        vec![],  // No upstream dependencies
+        Some(OperationalMeta {
+            row_count: Some(row_count as i64),
+            size_bytes: None,
+            partition_keys: vec![],
+        }),
+        vec![], // No upstream dependencies
         vec!["example".to_string(), "tutorial".to_string()],
     )?;
 
