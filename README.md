@@ -8,13 +8,14 @@
 
 MetaFuse captures dataset schemas, lineage, and operational metadata automatically from your data pipelines without requiring Kafka, MySQL, or Elasticsearch. Just a SQLite file on object storage.
 
-**Status:** v0.2.0 Production-Ready — Hardened for production with comprehensive validation, observability, and security. Local SQLite backend fully supported. Cloud backends (GCS/S3) coming in v0.3.0.
+**Status:** v0.3.0 Cloud-Ready — Production-hardened with GCS and S3 backends. Supports local SQLite, Google Cloud Storage, and AWS S3 with optimistic concurrency and caching.
 
 ## Why MetaFuse?
 
 - **Native DataFusion integration** - Emit metadata directly from pipelines
-- **Serverless-friendly** - $0-$5/month on object storage (GCS/S3 coming soon)
+- **Serverless-friendly** - $0-$5/month on object storage (GCS/S3 supported)
 - **Zero infrastructure** - No databases, no clusters to maintain
+- **Multi-cloud** - Works on local filesystem, Google Cloud Storage, and AWS S3
 - **Automatic lineage capture** - Track data flow through transformations
 - **Full-text search with FTS5** - Fast search with automatic trigger maintenance
 - **Optimistic concurrency** - Safe concurrent writes with version-based locking
@@ -40,7 +41,18 @@ This downloads pre-built binaries for your platform (Linux/macOS, x86_64/ARM64).
 ```bash
 git clone https://github.com/ethan-tyler/MetaFuse.git
 cd MetaFuse
+
+# Local-only (default)
 cargo build --release
+
+# With GCS support
+cargo build --release --features gcs
+
+# With S3 support
+cargo build --release --features s3
+
+# With all cloud backends
+cargo build --release --features cloud
 ```
 
 #### Option 3: Docker
@@ -48,6 +60,40 @@ cargo build --release
 ```bash
 docker pull ghcr.io/ethan-tyler/metafuse-api:latest
 docker run -p 8080:8080 -v $(pwd)/data:/data ghcr.io/ethan-tyler/metafuse-api
+```
+
+### Backend Options
+
+MetaFuse supports multiple storage backends:
+
+| Backend | URI Format | Authentication | Features Required |
+|---------|-----------|----------------|-------------------|
+| **Local SQLite** | `file://catalog.db` or `catalog.db` | None | `local` (default) |
+| **Google Cloud Storage** | `gs://bucket/path/catalog.db` | ADC, GOOGLE_APPLICATION_CREDENTIALS | `gcs` |
+| **Amazon S3** | `s3://bucket/key?region=us-east-1` | AWS credential chain | `s3` |
+
+#### Environment Variables
+
+- **`METAFUSE_CATALOG_URI`**: Override default catalog location
+- **`METAFUSE_CACHE_TTL_SECS`**: Cache TTL for cloud backends (default: 60, 0 to disable)
+- **`GOOGLE_APPLICATION_CREDENTIALS`**: Path to GCS service account JSON (GCS only)
+- **`AWS_ACCESS_KEY_ID`**, **`AWS_SECRET_ACCESS_KEY`**: AWS credentials (S3 only)
+
+#### Examples
+
+```bash
+# Local
+export METAFUSE_CATALOG_URI="file://my_catalog.db"
+metafuse init
+
+# Google Cloud Storage
+export METAFUSE_CATALOG_URI="gs://my-bucket/catalogs/prod.db"
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
+metafuse init
+
+# Amazon S3
+export METAFUSE_CATALOG_URI="s3://my-bucket/catalogs/prod.db?region=us-west-2"
+metafuse init
 ```
 
 ### Initialize Catalog
