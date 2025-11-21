@@ -174,7 +174,11 @@ pub fn backend_from_uri(uri: &str) -> Result<Box<dyn CatalogBackend>> {
         } => {
             #[cfg(feature = "s3")]
             {
-                Ok(Box::new(S3Backend::new(bucket, key, region.unwrap_or_default())))
+                Ok(Box::new(S3Backend::new(
+                    bucket,
+                    key,
+                    region.unwrap_or_default(),
+                )))
             }
             #[cfg(not(feature = "s3"))]
             {
