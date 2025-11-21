@@ -19,13 +19,13 @@ mod cache;
 #[cfg(any(feature = "gcs", feature = "s3"))]
 use bytes::Bytes;
 #[cfg(any(feature = "gcs", feature = "s3"))]
-use cache::CatalogCache;
+use cache::{CatalogCache, HeadCheckBackend};
 
 /// Convenience alias for trait objects.
 pub type DynCatalogBackend = dyn CatalogBackend;
 
 /// Versioning metadata for optimistic concurrency checks on object storage.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
     any(feature = "gcs", feature = "s3"),
     derive(serde::Serialize, serde::Deserialize)
@@ -399,7 +399,7 @@ impl CatalogBackend for GcsBackend {
         // Check cache first
         let uri = format!("gs://{}", self.object_path);
         if let Some(ref cache) = self.cache {
-            if let Some(cached) = cache.get(&uri)? {
+            if let Some(cached) = cache.get(&uri, Some(self))? {
                 tracing::debug!(uri = uri, "Using cached catalog");
                 return Ok(cached);
             }
@@ -624,6 +624,29 @@ impl CatalogBackend for GcsBackend {
     }
 }
 
+#[cfg(feature = "gcs")]
+impl HeadCheckBackend for GcsBackend {
+    fn head_check(&self, _uri: &str) -> Result<ObjectVersion> {
+        tokio_runtime().block_on(async {
+            // Perform HEAD request to get current generation
+            let head_result = self
+                .store
+                .head(&self.object_path)
+                .await
+                .map_err(|e| CatalogError::Other(format!("HEAD request failed: {}", e)))?;
+
+            let generation = head_result
+                .version
+                .ok_or_else(|| CatalogError::Other("Missing generation in HEAD response".into()))?;
+
+            Ok(ObjectVersion {
+                generation: Some(generation),
+                etag: None,
+            })
+        })
+    }
+}
+
 #[cfg(not(feature = "gcs"))]
 pub struct GcsBackend;
 
@@ -733,7 +756,7 @@ impl CatalogBackend for S3Backend {
         // Check cache first
         let uri = format!("s3://{}", self.object_path);
         if let Some(ref cache) = self.cache {
-            if let Some(cached) = cache.get(&uri)? {
+            if let Some(cached) = cache.get(&uri, Some(self))? {
                 tracing::debug!(uri = uri, "Using cached catalog");
                 return Ok(cached);
             }
@@ -954,6 +977,29 @@ impl CatalogBackend for S3Backend {
             );
 
             Ok(())
+        })
+    }
+}
+
+#[cfg(feature = "s3")]
+impl HeadCheckBackend for S3Backend {
+    fn head_check(&self, _uri: &str) -> Result<ObjectVersion> {
+        tokio_runtime().block_on(async {
+            // Perform HEAD request to get current ETag
+            let head_result = self
+                .store
+                .head(&self.object_path)
+                .await
+                .map_err(|e| CatalogError::Other(format!("HEAD request failed: {}", e)))?;
+
+            let etag = head_result
+                .e_tag
+                .ok_or_else(|| CatalogError::Other("Missing ETag in HEAD response".into()))?;
+
+            Ok(ObjectVersion {
+                generation: None,
+                etag: Some(etag),
+            })
         })
     }
 }

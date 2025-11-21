@@ -25,6 +25,7 @@ bytes = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+testcontainers = "0.15"
 
 [features]
 default = ["local"]

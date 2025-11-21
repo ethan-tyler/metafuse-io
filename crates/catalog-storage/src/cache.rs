@@ -30,16 +30,40 @@ use std::path::PathBuf;
 #[cfg(any(feature = "gcs", feature = "s3"))]
 use std::time::{Duration, SystemTime};
 
+/// Trait for backends that support HEAD requests for cache revalidation
+///
+/// Allows cache to check if a remote object has changed without downloading it.
+#[cfg(any(feature = "gcs", feature = "s3"))]
+pub trait HeadCheckBackend {
+    /// Perform a HEAD request to get the remote object version
+    ///
+    /// # Arguments
+    /// * `uri` - The URI that was used to cache the object
+    ///
+    /// # Returns
+    /// - `Ok(version)` if HEAD request succeeded
+    /// - `Err(...)` if HEAD request failed (cache should gracefully fall back)
+    fn head_check(&self, uri: &str) -> Result<ObjectVersion>;
+}
+
 /// Cache for cloud-downloaded catalogs
 ///
 /// Reduces cloud API calls by maintaining local copies of catalog files
 /// with metadata for version tracking and TTL-based expiration.
+///
+/// ## Revalidation
+///
+/// When `revalidate` is enabled, the cache performs a HEAD request to check
+/// if the cached version matches the remote version before returning the cached copy.
+/// This adds latency (~50-200ms) but ensures freshness.
 #[cfg(any(feature = "gcs", feature = "s3"))]
 pub struct CatalogCache {
     /// Base directory for cache storage (XDG-compliant)
     base_dir: PathBuf,
     /// Time-to-live for cache entries
     ttl: Duration,
+    /// Whether to revalidate cached entries with HEAD requests
+    revalidate: bool,
 }
 
 #[cfg(any(feature = "gcs", feature = "s3"))]
@@ -64,6 +88,11 @@ impl CatalogCache {
             return Ok(None);
         }
 
+        let revalidate = std::env::var("METAFUSE_CACHE_REVALIDATE")
+            .ok()
+            .and_then(|s| s.parse::<bool>().ok())
+            .unwrap_or(false);
+
         let base_dir = Self::cache_dir()?;
         std::fs::create_dir_all(&base_dir)
             .map_err(|e| CatalogError::Other(format!("Failed to create cache directory: {}", e)))?;
@@ -71,12 +100,14 @@ impl CatalogCache {
         tracing::debug!(
             path = %base_dir.display(),
             ttl_secs = ttl_secs,
+            revalidate = revalidate,
             "Initialized catalog cache"
         );
 
         Ok(Some(Self {
             base_dir,
             ttl: Duration::from_secs(ttl_secs),
+            revalidate,
         }))
     }
 
@@ -91,12 +122,22 @@ impl CatalogCache {
     ///
     /// # Arguments
     /// * `uri` - Unique identifier for the catalog (e.g., "gs://bucket/path")
+    /// * `backend` - Optional backend for revalidation (required if revalidate=true)
     ///
     /// # Returns
     /// - `Ok(Some(download))` if cached and not expired
     /// - `Ok(None)` if not cached or expired
     /// - `Err(...)` on I/O errors
-    pub fn get(&self, uri: &str) -> Result<Option<CatalogDownload>> {
+    ///
+    /// # Revalidation
+    /// If `revalidate` is enabled and a backend is provided, performs a HEAD
+    /// request to check if the cached version matches the remote version.
+    /// On HEAD failure, falls back gracefully to cached copy with a warning.
+    pub fn get(
+        &self,
+        uri: &str,
+        backend: Option<&dyn HeadCheckBackend>,
+    ) -> Result<Option<CatalogDownload>> {
         let cache_key = self.cache_path(uri);
         let meta_path = self.meta_path(uri);
 
@@ -137,6 +178,57 @@ impl CatalogCache {
         // Read catalog version (requires opening SQLite connection)
         let conn = rusqlite::Connection::open(&cache_key)?;
         let catalog_version = metafuse_catalog_core::get_catalog_version(&conn)?;
+
+        // Perform revalidation if enabled
+        if self.revalidate {
+            if let Some(backend) = backend {
+                let mut attempts = 0u32;
+                let mut last_err: Option<CatalogError> = None;
+                while attempts < 3 {
+                    match backend.head_check(uri) {
+                        Ok(current_remote_version) => {
+                            // Compare cached version with current remote version
+                            if remote_version != current_remote_version {
+                                tracing::debug!(
+                                    uri = uri,
+                                    cached_version = ?remote_version,
+                                    remote_version = ?current_remote_version,
+                                    "Cache stale after revalidation"
+                                );
+                                return Ok(None);
+                            }
+                            tracing::debug!(uri = uri, "Cache revalidation succeeded");
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = Some(e);
+                            attempts += 1;
+                            if attempts >= 3 {
+                                break;
+                            }
+                            // small backoff before retry
+                            std::thread::sleep(Duration::from_millis(
+                                50 * 2u64.saturating_pow(attempts - 1),
+                            ));
+                        }
+                    }
+                }
+
+                if let Some(e) = last_err {
+                    // Graceful fallback: log warning and use cached copy
+                    tracing::warn!(
+                        uri = uri,
+                        error = %e,
+                        "Cache revalidation failed after retries, falling back to cached copy"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    uri = uri,
+                    "Cache revalidation enabled but no backend provided"
+                );
+            }
+        }
 
         tracing::debug!(uri = uri, age_secs = age.as_secs(), "Cache hit");
 
@@ -252,7 +344,7 @@ mod tests {
 
         std::env::set_var("METAFUSE_CACHE_TTL_SECS", "60");
         let cache = CatalogCache::from_env().unwrap().unwrap();
-        let result = cache.get("gs://nonexistent/catalog.db");
+        let result = cache.get("gs://nonexistent/catalog.db", None);
         std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
         assert!(result.unwrap().is_none());
     }
@@ -284,5 +376,51 @@ mod tests {
         let result = cache.invalidate(uri);
         std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_revalidation_disabled_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        std::env::set_var("METAFUSE_CACHE_TTL_SECS", "60");
+        // Don't set METAFUSE_CACHE_REVALIDATE
+        let cache = CatalogCache::from_env().unwrap().unwrap();
+
+        // Revalidation should be disabled by default
+        assert_eq!(cache.revalidate, false);
+
+        std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
+    }
+
+    #[test]
+    fn test_revalidation_enabled() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        std::env::set_var("METAFUSE_CACHE_TTL_SECS", "60");
+        std::env::set_var("METAFUSE_CACHE_REVALIDATE", "true");
+
+        let cache = CatalogCache::from_env().unwrap().unwrap();
+
+        // Revalidation should be enabled
+        assert_eq!(cache.revalidate, true);
+
+        std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
+        std::env::remove_var("METAFUSE_CACHE_REVALIDATE");
+    }
+
+    #[test]
+    fn test_revalidation_explicit_disable() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        std::env::set_var("METAFUSE_CACHE_TTL_SECS", "60");
+        std::env::set_var("METAFUSE_CACHE_REVALIDATE", "false");
+
+        let cache = CatalogCache::from_env().unwrap().unwrap();
+
+        // Revalidation should be disabled
+        assert_eq!(cache.revalidate, false);
+
+        std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
+        std::env::remove_var("METAFUSE_CACHE_REVALIDATE");
     }
 }
