@@ -17,6 +17,8 @@ use tempfile::NamedTempFile;
 #[cfg(any(feature = "gcs", feature = "s3"))]
 mod cache;
 #[cfg(any(feature = "gcs", feature = "s3"))]
+use bytes::Bytes;
+#[cfg(any(feature = "gcs", feature = "s3"))]
 use cache::CatalogCache;
 
 /// Convenience alias for trait objects.
@@ -488,7 +490,7 @@ impl CatalogBackend for GcsBackend {
         // Read catalog file data once; clone bytes cheaply across retries
         let data = std::fs::read(&download.path)
             .map_err(|e| CatalogError::Other(format!("Failed to read catalog file: {}", e)))?;
-        let data = bytes::Bytes::from(data);
+        let data = Bytes::from(data);
 
         const MAX_RETRIES: u32 = 3;
         const BASE_DELAY_MS: u64 = 100;
@@ -510,12 +512,9 @@ impl CatalogBackend for GcsBackend {
                     ..Default::default()
                 };
 
-                self.store.put_opts(
-                    &self.object_path,
-                    PutPayload::from(data.clone()),
-                    put_opts,
-                )
-                .await
+                self.store
+                    .put_opts(&self.object_path, PutPayload::from(data.clone()), put_opts)
+                    .await
             });
 
             match result {
@@ -826,7 +825,7 @@ impl CatalogBackend for S3Backend {
         // Read catalog file data once; clone bytes cheaply across retries
         let data = std::fs::read(&download.path)
             .map_err(|e| CatalogError::Other(format!("Failed to read catalog file: {}", e)))?;
-        let data = bytes::Bytes::from(data);
+        let data = Bytes::from(data);
 
         const MAX_RETRIES: u32 = 3;
         const BASE_DELAY_MS: u64 = 100;
@@ -847,12 +846,9 @@ impl CatalogBackend for S3Backend {
                     ..Default::default()
                 };
 
-                self.store.put_opts(
-                    &self.object_path,
-                    PutPayload::from(data.clone()),
-                    put_opts,
-                )
-                .await
+                self.store
+                    .put_opts(&self.object_path, PutPayload::from(data.clone()), put_opts)
+                    .await
             });
 
             match result {
