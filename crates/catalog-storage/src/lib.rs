@@ -11,11 +11,18 @@ use std::path::{Path, PathBuf};
 #[cfg(any(feature = "gcs", feature = "s3"))]
 use tempfile::NamedTempFile;
 
+// Cache module for cloud backends
+#[cfg(any(feature = "gcs", feature = "s3"))]
+mod cache;
+#[cfg(any(feature = "gcs", feature = "s3"))]
+use cache::CatalogCache;
+
 /// Convenience alias for trait objects.
 pub type DynCatalogBackend = dyn CatalogBackend;
 
 /// Versioning metadata for optimistic concurrency checks on object storage.
 #[derive(Debug, Clone)]
+#[cfg_attr(any(feature = "gcs", feature = "s3"), derive(serde::Serialize, serde::Deserialize))]
 pub struct ObjectVersion {
     /// Generation (GCS) or similar monotonic version identifier.
     pub generation: Option<String>,
@@ -292,29 +299,83 @@ impl CatalogBackend for LocalSqliteBackend {
     }
 }
 
-/// GCS backend for catalog storage (future implementation)
+/// GCS backend for catalog storage
 ///
-/// This will implement the SQLite-on-object-storage pattern:
-/// 1. Download catalog.db from GCS bucket
-/// 2. Open local connection
+/// Implements the SQLite-on-object-storage pattern:
+/// 1. Download catalog.db from GCS bucket to local temp file
+/// 2. Open local SQLite connection
 /// 3. Perform operations
-/// 4. Upload back to GCS with generation number check (optimistic concurrency)
+/// 4. Upload back to GCS with generation-based optimistic concurrency
 ///
-/// ## Feature Flag (Not Yet Implemented)
+/// ## Authentication
 ///
-/// To enable GCS support, add a feature flag to Cargo.toml:
-/// ```toml
-/// [features]
-/// gcs = ["object_store/gcp"]
-/// ```
+/// Uses Application Default Credentials (ADC) in this order:
+/// 1. `GOOGLE_APPLICATION_CREDENTIALS` environment variable
+/// 2. Workload Identity (for GKE)
+/// 3. Compute Engine metadata server
+/// 4. gcloud CLI credentials (development)
 ///
-/// Real implementation should use the `object_store` crate for unified cloud storage access.
-#[allow(dead_code)]
+/// ## Concurrency Control
+///
+/// Uses GCS generation numbers for optimistic locking:
+/// - Download captures current generation
+/// - Upload uses `if-generation-match` precondition
+/// - Returns `ConflictError` on 412 Precondition Failed
+#[cfg(feature = "gcs")]
+pub struct GcsBackend {
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
+    object_path: object_store::path::Path,
+    cache: Option<CatalogCache>,
+}
+
+#[cfg(feature = "gcs")]
+impl GcsBackend {
+    /// Create a new GCS backend
+    ///
+    /// # Arguments
+    /// * `bucket` - GCS bucket name
+    /// * `object` - Object path within the bucket
+    ///
+    /// # Example
+    /// ```no_run
+    /// use metafuse_catalog_storage::GcsBackend;
+    ///
+    /// let backend = GcsBackend::new("my-bucket", "catalogs/prod.db");
+    /// ```
+    pub fn new(bucket: impl Into<String>, object: impl Into<String>) -> Self {
+        use object_store::gcp::GoogleCloudStorageBuilder;
+
+        let bucket = bucket.into();
+        let object_path = object.into();
+
+        // Build GCS client with Application Default Credentials
+        let store = GoogleCloudStorageBuilder::from_env()
+            .with_bucket_name(&bucket)
+            .build()
+            .expect("Failed to create GCS client. Check GOOGLE_APPLICATION_CREDENTIALS.");
+
+        // Initialize cache (optional based on env config)
+        let cache = CatalogCache::from_env()
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "Failed to initialize cache, proceeding without caching");
+                None
+            });
+
+        Self {
+            store: std::sync::Arc::new(store),
+            object_path: object_store::path::Path::from(object_path),
+            cache,
+        }
+    }
+}
+
+#[cfg(not(feature = "gcs"))]
 pub struct GcsBackend {
     bucket: String,
     path: String,
 }
 
+#[cfg(not(feature = "gcs"))]
 impl GcsBackend {
     pub fn new(bucket: impl Into<String>, path: impl Into<String>) -> Self {
         Self {
@@ -327,81 +388,212 @@ impl GcsBackend {
 #[cfg(feature = "gcs")]
 impl CatalogBackend for GcsBackend {
     fn download(&self) -> Result<CatalogDownload> {
-        let _file = NamedTempFile::new().map_err(|e| {
-            CatalogError::Other(format!(
-                "Failed to create temp file for GCS download: {}",
-                e
-            ))
-        })?;
-        // TODO: Implement download using google-cloud-storage with generation tracking.
-        // Example implementation:
-        // 1. Create a temp file using NamedTempFile::new()?
-        // 2. Download object from GCS bucket to temp file
-        // 3. Capture the current generation number from object metadata
-        // 4. Return CatalogDownload { path: temp_path, version: Some(ObjectVersion { generation: Some(gen), etag: None }) }
-        Err(CatalogError::Other(
-            "GCS backend not implemented; enable gcs feature and add download logic".to_string(),
-        ))
+        // Check cache first
+        let uri = format!("gs://{}", self.object_path);
+        if let Some(ref cache) = self.cache {
+            if let Some(cached) = cache.get(&uri)? {
+                tracing::debug!(uri = uri, "Using cached catalog");
+                return Ok(cached);
+            }
+        }
+
+        // Use tokio runtime for async operations
+        let runtime = tokio::runtime::Runtime::new()
+            .map_err(|e| CatalogError::Other(format!("Failed to create tokio runtime: {}", e)))?;
+
+        runtime.block_on(async {
+            // Download object from GCS
+            let get_result = self.store.get(&self.object_path).await.map_err(|e| match e {
+                object_store::Error::NotFound { .. } => CatalogError::Other(format!(
+                    "Catalog not found at gs://{} (run 'metafuse init' first)",
+                    self.object_path
+                )),
+                _ => CatalogError::Other(format!("Failed to download from GCS: {}", e)),
+            })?;
+
+            // Extract generation number from metadata (GCS-specific)
+            let generation = get_result
+                .meta
+                .version
+                .clone()
+                .ok_or_else(|| CatalogError::Other("Missing generation in GCS metadata".into()))?;
+
+            tracing::debug!(
+                object = %self.object_path,
+                generation = %generation,
+                "Downloaded catalog from GCS"
+            );
+
+            // Create temp file for local operations
+            let temp_file = NamedTempFile::new()
+                .map_err(|e| CatalogError::Other(format!("Failed to create temp file: {}", e)))?;
+
+            // Download data to temp file
+            let data = get_result.bytes().await.map_err(|e| {
+                CatalogError::Other(format!("Failed to read GCS object data: {}", e))
+            })?;
+
+            std::fs::write(temp_file.path(), &data).map_err(|e| {
+                CatalogError::Other(format!("Failed to write temp file: {}", e))
+            })?;
+
+            // Open connection to read catalog version
+            let conn = Connection::open(temp_file.path())?;
+            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            init_sqlite_schema(&conn)?;
+            let catalog_version = metafuse_catalog_core::get_catalog_version(&conn)?;
+
+            // Persist temp file (keep it alive for subsequent operations)
+            let temp_path = temp_file.into_temp_path().to_path_buf();
+
+            let download = CatalogDownload {
+                path: temp_path,
+                catalog_version,
+                remote_version: Some(ObjectVersion {
+                    generation: Some(generation),
+                    etag: None,
+                }),
+            };
+
+            // Cache the downloaded catalog
+            if let Some(ref cache) = self.cache {
+                if let Err(e) = cache.put(&uri, &download) {
+                    tracing::warn!(error = %e, "Failed to cache catalog, continuing");
+                }
+            }
+
+            Ok(download)
+        })
     }
 
     fn upload(&self, download: &CatalogDownload) -> Result<()> {
-        // TODO: Implement upload with generation precondition checks for optimistic concurrency.
-        // Example implementation:
-        // 1. Validate catalog_version was incremented (sanity check)
-        // 2. Extract generation number from download.remote_version
-        // 3. Upload file with if-generation-match precondition set to the captured generation
-        // 4. If GCS returns 412 Precondition Failed, return CatalogError::ConflictError
-        // 5. If upload succeeds, the generation number is automatically incremented by GCS
-        //
-        // Pseudocode:
-        // let Some(remote_version) = &download.remote_version else {
-        //     return Err(CatalogError::Other("Missing remote version for upload".into()));
-        // };
-        // let Some(generation) = &remote_version.generation else {
-        //     return Err(CatalogError::Other("Missing generation for GCS upload".into()));
-        // };
-        //
-        // let request = storage_client.upload()
-        //     .bucket(&self.bucket)
-        //     .object(&self.path)
-        //     .if_generation_match(generation.parse::<i64>()?)
-        //     .file(&download.path);
-        //
-        // match request.send().await {
-        //     Ok(_) => Ok(()),
-        //     Err(e) if is_precondition_failed(&e) => {
-        //         Err(CatalogError::ConflictError(format!(
-        //             "Catalog was modified by another process (expected generation: {})",
-        //             generation
-        //         )))
-        //     }
-        //     Err(e) => Err(e.into()),
-        // }
-        let _ = download; // Silence unused warning
-        Err(CatalogError::Other(
-            "GCS backend not implemented; enable gcs feature and add upload logic".to_string(),
-        ))
+        use object_store::{PutMode, PutOptions, PutPayload};
+
+        // Validate remote version exists
+        let remote_version = download.remote_version.as_ref().ok_or_else(|| {
+            CatalogError::Other("Missing remote version for GCS upload".into())
+        })?;
+
+        let generation = remote_version.generation.as_ref().ok_or_else(|| {
+            CatalogError::Other("Missing generation for GCS upload".into())
+        })?;
+
+        // Read catalog file data
+        let data = std::fs::read(&download.path)
+            .map_err(|e| CatalogError::Other(format!("Failed to read catalog file: {}", e)))?;
+
+        // Use tokio runtime for async upload
+        let runtime = tokio::runtime::Runtime::new()
+            .map_err(|e| CatalogError::Other(format!("Failed to create tokio runtime: {}", e)))?;
+
+        runtime.block_on(async {
+            // Upload with generation-based precondition (optimistic locking)
+            // Note: object_store 0.12.4 doesn't expose direct generation/etag matching
+            // We use the version string to create an UpdateVersion
+            use object_store::UpdateVersion;
+
+            let update_version = UpdateVersion {
+                e_tag: None,
+                version: Some(generation.clone()),
+            };
+
+            let put_opts = PutOptions {
+                mode: PutMode::Update(update_version),
+                ..Default::default()
+            };
+
+            self.store
+                .put_opts(&self.object_path, PutPayload::from(data), put_opts)
+                .await
+                .map_err(|e| match e {
+                    object_store::Error::Precondition { .. } => CatalogError::ConflictError(
+                        format!(
+                            "Catalog was modified by another process (expected generation: {}). Retry your operation.",
+                            generation
+                        ),
+                    ),
+                    _ => CatalogError::Other(format!("Failed to upload to GCS: {}", e)),
+                })?;
+
+            tracing::info!(
+                object = %self.object_path,
+                generation = %generation,
+                "Uploaded catalog to GCS"
+            );
+
+            // Invalidate cache after successful upload
+            let uri = format!("gs://{}", self.object_path);
+            if let Some(ref cache) = self.cache {
+                if let Err(e) = cache.invalidate(&uri) {
+                    tracing::warn!(error = %e, "Failed to invalidate cache");
+                }
+            }
+
+            Ok(())
+        })
     }
 
     fn get_connection(&self) -> Result<Connection> {
         let download = self.download()?;
         let conn = Connection::open(&download.path)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")
-            .map_err(CatalogError::from)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         init_sqlite_schema(&conn)?;
         Ok(conn)
     }
 
     fn exists(&self) -> Result<bool> {
-        Err(CatalogError::Other(
-            "GCS backend not implemented; enable gcs feature and add exists logic".to_string(),
-        ))
+        let runtime = tokio::runtime::Runtime::new()
+            .map_err(|e| CatalogError::Other(format!("Failed to create tokio runtime: {}", e)))?;
+
+        runtime.block_on(async {
+            // Check if object exists using HEAD request
+            match self.store.head(&self.object_path).await {
+                Ok(_) => Ok(true),
+                Err(object_store::Error::NotFound { .. }) => Ok(false),
+                Err(e) => Err(CatalogError::Other(format!("Failed to check GCS object: {}", e))),
+            }
+        })
     }
 
     fn initialize(&self) -> Result<()> {
-        Err(CatalogError::Other(
-            "GCS backend not implemented; enable gcs feature and add initialize logic".to_string(),
-        ))
+        if self.exists()? {
+            return Err(CatalogError::Other(format!(
+                "Catalog already exists at gs://{}",
+                self.object_path
+            )));
+        }
+
+        // Create a new SQLite database in a temp file
+        let temp_file = NamedTempFile::new()
+            .map_err(|e| CatalogError::Other(format!("Failed to create temp file: {}", e)))?;
+
+        let conn = Connection::open(temp_file.path())?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        init_sqlite_schema(&conn)?;
+        drop(conn); // Close connection before uploading
+
+        // Upload the initialized catalog
+        let data = std::fs::read(temp_file.path())
+            .map_err(|e| CatalogError::Other(format!("Failed to read temp file: {}", e)))?;
+
+        let runtime = tokio::runtime::Runtime::new()
+            .map_err(|e| CatalogError::Other(format!("Failed to create tokio runtime: {}", e)))?;
+
+        runtime.block_on(async {
+            use object_store::PutPayload;
+
+            self.store
+                .put(&self.object_path, PutPayload::from(data))
+                .await
+                .map_err(|e| CatalogError::Other(format!("Failed to upload initial catalog: {}", e)))?;
+
+            tracing::info!(
+                object = %self.object_path,
+                "Initialized new catalog in GCS"
+            );
+
+            Ok(())
+        })
     }
 }
 
@@ -438,26 +630,103 @@ impl CatalogBackend for GcsBackend {
     }
 }
 
-/// S3 backend for catalog storage (future implementation)
+/// S3 backend for catalog storage
 ///
-/// Similar to GCS backend but using AWS S3.
+/// Implements the SQLite-on-object-storage pattern for AWS S3:
+/// 1. Download catalog.db from S3 bucket to local temp file
+/// 2. Open local SQLite connection
+/// 3. Perform operations
+/// 4. Upload back to S3 with ETag-based optimistic concurrency
 ///
-/// ## Feature Flag (Not Yet Implemented)
+/// ## Authentication
 ///
-/// To enable S3 support, add a feature flag to Cargo.toml:
-/// ```toml
-/// [features]
-/// s3 = ["object_store/aws"]
+/// Uses AWS credential provider chain in this order:
+/// 1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
+/// 2. Web Identity Token (for EKS IRSA)
+/// 3. ECS Task Role (for ECS)
+/// 4. EC2 Instance Profile (for EC2)
+/// 5. AWS CLI credentials (~/.aws/credentials)
+///
+/// ## Concurrency Control
+///
+/// Uses S3 ETags for optimistic locking:
+/// - Download captures current ETag
+/// - Upload uses `if-match` precondition
+/// - Returns `ConflictError` on 412 Precondition Failed
+///
+/// ## Region Support
+///
+/// Optionally specify region via URI query parameter:
+/// ```text
+/// s3://my-bucket/catalog.db?region=us-west-2
 /// ```
-///
-/// Real implementation should use the `object_store` crate for unified cloud storage access.
-#[allow(dead_code)]
+#[cfg(feature = "s3")]
+pub struct S3Backend {
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
+    object_path: object_store::path::Path,
+    cache: Option<CatalogCache>,
+}
+
+#[cfg(feature = "s3")]
+impl S3Backend {
+    /// Create a new S3 backend
+    ///
+    /// # Arguments
+    /// * `bucket` - S3 bucket name
+    /// * `key` - Object key within the bucket
+    /// * `region` - Optional AWS region (defaults to SDK's configured region)
+    ///
+    /// # Example
+    /// ```no_run
+    /// use metafuse_catalog_storage::S3Backend;
+    ///
+    /// let backend = S3Backend::new("my-bucket", "catalogs/prod.db", "us-east-1");
+    /// ```
+    pub fn new(
+        bucket: impl Into<String>,
+        key: impl Into<String>,
+        region: impl Into<String>,
+    ) -> Self {
+        use object_store::aws::AmazonS3Builder;
+
+        let bucket = bucket.into();
+        let object_path = key.into();
+        let region = region.into();
+
+        // Build S3 client with AWS credential chain
+        let mut builder = AmazonS3Builder::from_env().with_bucket_name(&bucket);
+
+        if !region.is_empty() {
+            builder = builder.with_region(&region);
+        }
+
+        let store = builder
+            .build()
+            .expect("Failed to create S3 client. Check AWS credentials.");
+
+        // Initialize cache (optional based on env config)
+        let cache = CatalogCache::from_env()
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "Failed to initialize cache, proceeding without caching");
+                None
+            });
+
+        Self {
+            store: std::sync::Arc::new(store),
+            object_path: object_store::path::Path::from(object_path),
+            cache,
+        }
+    }
+}
+
+#[cfg(not(feature = "s3"))]
 pub struct S3Backend {
     bucket: String,
     path: String,
     region: String,
 }
 
+#[cfg(not(feature = "s3"))]
 impl S3Backend {
     pub fn new(
         bucket: impl Into<String>,
@@ -475,78 +744,210 @@ impl S3Backend {
 #[cfg(feature = "s3")]
 impl CatalogBackend for S3Backend {
     fn download(&self) -> Result<CatalogDownload> {
-        let _file = NamedTempFile::new().map_err(|e| {
-            CatalogError::Other(format!("Failed to create temp file for S3 download: {}", e))
-        })?;
-        // TODO: Implement download using aws-sdk-s3 with etag tracking.
-        // Example implementation:
-        // 1. Create a temp file using NamedTempFile::new()?
-        // 2. Download object from S3 bucket to temp file
-        // 3. Capture the current ETag from object metadata
-        // 4. Return CatalogDownload { path: temp_path, version: Some(ObjectVersion { generation: None, etag: Some(etag) }) }
-        Err(CatalogError::Other(
-            "S3 backend not implemented; enable s3 feature and add download logic".to_string(),
-        ))
+        // Check cache first
+        let uri = format!("s3://{}", self.object_path);
+        if let Some(ref cache) = self.cache {
+            if let Some(cached) = cache.get(&uri)? {
+                tracing::debug!(uri = uri, "Using cached catalog");
+                return Ok(cached);
+            }
+        }
+
+        // Use tokio runtime for async operations
+        let runtime = tokio::runtime::Runtime::new()
+            .map_err(|e| CatalogError::Other(format!("Failed to create tokio runtime: {}", e)))?;
+
+        runtime.block_on(async {
+            // Download object from S3
+            let get_result = self.store.get(&self.object_path).await.map_err(|e| match e {
+                object_store::Error::NotFound { .. } => CatalogError::Other(format!(
+                    "Catalog not found at s3://{} (run 'metafuse init' first)",
+                    self.object_path
+                )),
+                _ => CatalogError::Other(format!("Failed to download from S3: {}", e)),
+            })?;
+
+            // Extract ETag from metadata (S3-specific)
+            let etag = get_result
+                .meta
+                .e_tag
+                .clone()
+                .ok_or_else(|| CatalogError::Other("Missing ETag in S3 metadata".into()))?;
+
+            tracing::debug!(
+                object = %self.object_path,
+                etag = %etag,
+                "Downloaded catalog from S3"
+            );
+
+            // Create temp file for local operations
+            let temp_file = NamedTempFile::new()
+                .map_err(|e| CatalogError::Other(format!("Failed to create temp file: {}", e)))?;
+
+            // Download data to temp file
+            let data = get_result.bytes().await.map_err(|e| {
+                CatalogError::Other(format!("Failed to read S3 object data: {}", e))
+            })?;
+
+            std::fs::write(temp_file.path(), &data).map_err(|e| {
+                CatalogError::Other(format!("Failed to write temp file: {}", e))
+            })?;
+
+            // Open connection to read catalog version
+            let conn = Connection::open(temp_file.path())?;
+            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            init_sqlite_schema(&conn)?;
+            let catalog_version = metafuse_catalog_core::get_catalog_version(&conn)?;
+
+            // Persist temp file (keep it alive for subsequent operations)
+            let temp_path = temp_file.into_temp_path().to_path_buf();
+
+            let download = CatalogDownload {
+                path: temp_path,
+                catalog_version,
+                remote_version: Some(ObjectVersion {
+                    generation: None,
+                    etag: Some(etag),
+                }),
+            };
+
+            // Cache the downloaded catalog
+            if let Some(ref cache) = self.cache {
+                if let Err(e) = cache.put(&uri, &download) {
+                    tracing::warn!(error = %e, "Failed to cache catalog, continuing");
+                }
+            }
+
+            Ok(download)
+        })
     }
 
     fn upload(&self, download: &CatalogDownload) -> Result<()> {
-        // TODO: Implement upload with ETag precondition checks for optimistic concurrency.
-        // Example implementation:
-        // 1. Validate catalog_version was incremented (sanity check)
-        // 2. Extract ETag from download.remote_version
-        // 3. Upload file with if-match precondition set to the captured ETag
-        // 4. If S3 returns 412 Precondition Failed, return CatalogError::ConflictError
-        // 5. If upload succeeds, S3 generates a new ETag for the updated object
-        //
-        // Pseudocode:
-        // let Some(remote_version) = &download.remote_version else {
-        //     return Err(CatalogError::Other("Missing remote version for upload".into()));
-        // };
-        // let Some(etag) = &remote_version.etag else {
-        //     return Err(CatalogError::Other("Missing ETag for S3 upload".into()));
-        // };
-        //
-        // let request = s3_client.put_object()
-        //     .bucket(&self.bucket)
-        //     .key(&self.path)
-        //     .if_match(etag)
-        //     .body(ByteStream::from_path(&download.path).await?);
-        //
-        // match request.send().await {
-        //     Ok(_) => Ok(()),
-        //     Err(e) if is_precondition_failed(&e) => {
-        //         Err(CatalogError::ConflictError(format!(
-        //             "Catalog was modified by another process (expected ETag: {})",
-        //             etag
-        //         )))
-        //     }
-        //     Err(e) => Err(e.into()),
-        // }
-        let _ = download; // Silence unused warning
-        Err(CatalogError::Other(
-            "S3 backend not implemented; enable s3 feature and add upload logic".to_string(),
-        ))
+        use object_store::{PutMode, PutOptions, PutPayload};
+
+        // Validate remote version exists
+        let remote_version = download.remote_version.as_ref().ok_or_else(|| {
+            CatalogError::Other("Missing remote version for S3 upload".into())
+        })?;
+
+        let etag = remote_version.etag.as_ref().ok_or_else(|| {
+            CatalogError::Other("Missing ETag for S3 upload".into())
+        })?;
+
+        // Read catalog file data
+        let data = std::fs::read(&download.path)
+            .map_err(|e| CatalogError::Other(format!("Failed to read catalog file: {}", e)))?;
+
+        // Use tokio runtime for async upload
+        let runtime = tokio::runtime::Runtime::new()
+            .map_err(|e| CatalogError::Other(format!("Failed to create tokio runtime: {}", e)))?;
+
+        runtime.block_on(async {
+            // Upload with ETag-based precondition (optimistic locking)
+            use object_store::UpdateVersion;
+
+            let update_version = UpdateVersion {
+                e_tag: Some(etag.clone()),
+                version: None,
+            };
+
+            let put_opts = PutOptions {
+                mode: PutMode::Update(update_version),
+                ..Default::default()
+            };
+
+            self.store
+                .put_opts(&self.object_path, PutPayload::from(data), put_opts)
+                .await
+                .map_err(|e| match e {
+                    object_store::Error::Precondition { .. } => CatalogError::ConflictError(
+                        format!(
+                            "Catalog was modified by another process (expected ETag: {}). Retry your operation.",
+                            etag
+                        ),
+                    ),
+                    _ => CatalogError::Other(format!("Failed to upload to S3: {}", e)),
+                })?;
+
+            tracing::info!(
+                object = %self.object_path,
+                etag = %etag,
+                "Uploaded catalog to S3"
+            );
+
+            // Invalidate cache after successful upload
+            let uri = format!("s3://{}", self.object_path);
+            if let Some(ref cache) = self.cache {
+                if let Err(e) = cache.invalidate(&uri) {
+                    tracing::warn!(error = %e, "Failed to invalidate cache");
+                }
+            }
+
+            Ok(())
+        })
     }
 
     fn get_connection(&self) -> Result<Connection> {
         let download = self.download()?;
         let conn = Connection::open(&download.path)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")
-            .map_err(CatalogError::from)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         init_sqlite_schema(&conn)?;
         Ok(conn)
     }
 
     fn exists(&self) -> Result<bool> {
-        Err(CatalogError::Other(
-            "S3 backend not implemented; enable s3 feature and add exists logic".to_string(),
-        ))
+        let runtime = tokio::runtime::Runtime::new()
+            .map_err(|e| CatalogError::Other(format!("Failed to create tokio runtime: {}", e)))?;
+
+        runtime.block_on(async {
+            // Check if object exists using HEAD request
+            match self.store.head(&self.object_path).await {
+                Ok(_) => Ok(true),
+                Err(object_store::Error::NotFound { .. }) => Ok(false),
+                Err(e) => Err(CatalogError::Other(format!("Failed to check S3 object: {}", e))),
+            }
+        })
     }
 
     fn initialize(&self) -> Result<()> {
-        Err(CatalogError::Other(
-            "S3 backend not implemented; enable s3 feature and add initialize logic".to_string(),
-        ))
+        if self.exists()? {
+            return Err(CatalogError::Other(format!(
+                "Catalog already exists at s3://{}",
+                self.object_path
+            )));
+        }
+
+        // Create a new SQLite database in a temp file
+        let temp_file = NamedTempFile::new()
+            .map_err(|e| CatalogError::Other(format!("Failed to create temp file: {}", e)))?;
+
+        let conn = Connection::open(temp_file.path())?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        init_sqlite_schema(&conn)?;
+        drop(conn); // Close connection before uploading
+
+        // Upload the initialized catalog
+        let data = std::fs::read(temp_file.path())
+            .map_err(|e| CatalogError::Other(format!("Failed to read temp file: {}", e)))?;
+
+        let runtime = tokio::runtime::Runtime::new()
+            .map_err(|e| CatalogError::Other(format!("Failed to create tokio runtime: {}", e)))?;
+
+        runtime.block_on(async {
+            use object_store::PutPayload;
+
+            self.store
+                .put(&self.object_path, PutPayload::from(data))
+                .await
+                .map_err(|e| CatalogError::Other(format!("Failed to upload initial catalog: {}", e)))?;
+
+            tracing::info!(
+                object = %self.object_path,
+                "Initialized new catalog in S3"
+            );
+
+            Ok(())
+        })
     }
 }
 
