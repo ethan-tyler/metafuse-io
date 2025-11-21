@@ -12,6 +12,7 @@ metafuse-catalog-core = { path = "../catalog-core" }
 rusqlite.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
+object_store = { version = "0.12.4", optional = true }
 
 # Future: GCS/S3 client libraries
 # google-cloud-storage = { version = "0.15", optional = true }
@@ -21,6 +22,7 @@ tempfile.workspace = true
 tempfile.workspace = true
 
 [features]
-default = []
-# gcs = ["google-cloud-storage"]
-# s3 = ["aws-sdk-s3"]
+default = ["local"]
+local = []
+gcs = ["object_store", "object_store/gcp"]
+s3 = ["object_store", "object_store/aws"]

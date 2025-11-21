@@ -90,19 +90,12 @@ cargo run --example lineage_tracking
 
 ## Prerequisites
 
-Before running examples:
+No setup required! Examples automatically create their own catalog databases:
 
-1. **Build the workspace:**
-   ```bash
-   cargo build --workspace
-   ```
+- `simple_pipeline` → `metafuse_catalog.db`
+- `lineage_tracking` → `lineage_catalog.db`
 
-2. **Initialize a catalog (optional):**
-   ```bash
-   cargo run --bin metafuse -- init
-   ```
-
-   The examples will create/update `metafuse_catalog.db` in the project root.
+Just run the examples and they'll handle initialization automatically.
 
 ---
 
@@ -159,10 +152,10 @@ curl "http://localhost:8080/api/v1/search?q=transactions"
    Created 5 rows with 3 columns
 
 2. Running DataFusion query...
-   Query returned 3 rows (filtered value > 150.0)
+   Query returned 4 rows (filtered value > 150.0)
 
 3. Emitting metadata to catalog...
-   Done Metadata emitted: sample_dataset
+   Metadata emitted: sample_dataset
 
 4. Verifying catalog entry...
    Run: metafuse show sample_dataset
@@ -179,21 +172,21 @@ Stage 1: Loading raw transaction data...
   Done Metadata emitted: raw_transactions
 
 Stage 2: Cleaning data (filter invalid records)...
-  Done Cleaned 5 transactions (removed 3 invalid)
-  Done Metadata emitted: cleaned_transactions
-  Done Lineage: raw_transactions -> cleaned_transactions
+  Cleaned 6 transactions (removed 2 invalid)
+  Metadata emitted: cleaned_transactions
+  Lineage: raw_transactions -> cleaned_transactions
 
 Stage 3: Aggregating daily summary...
-  Done Aggregated 4 customer summaries
-  Done Metadata emitted: daily_summary
-  Done Lineage: cleaned_transactions -> daily_summary
+  Aggregated 3 customer summaries
+  Metadata emitted: daily_summary
+  Lineage: cleaned_transactions -> daily_summary
 
 === Pipeline Complete ===
 
 Full lineage chain:
   raw_transactions (8 rows)
-    -> cleaned_transactions (5 rows)
-        -> daily_summary (4 rows)
+    -> cleaned_transactions (6 rows)
+        -> daily_summary (3 rows)
 ```
 
 ---
@@ -232,14 +225,18 @@ emitter.emit_dataset(
     "dataset_name",
     "/path/to/data.parquet",
     "parquet",
+    Some("Description"),
     Some("tenant"),
     Some("domain"),
     Some("owner@example.com"),
     schema,  // Arrow SchemaRef
-    Some("Description"),
-    Some(row_count),
-    vec!["upstream_dataset"],  // Lineage
-    vec!["tag1", "tag2"],      // Tags
+    Some(OperationalMeta {
+        row_count: Some(row_count),
+        size_bytes: None,
+        partition_keys: vec![],
+    }),
+    vec!["upstream_dataset".to_string()],  // Lineage
+    vec!["tag1".to_string(), "tag2".to_string()],  // Tags
 )?;
 ```
 

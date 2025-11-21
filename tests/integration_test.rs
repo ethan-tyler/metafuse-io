@@ -10,6 +10,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use metafuse_catalog_core::{init_sqlite_schema, OperationalMeta};
 use metafuse_catalog_emitter::Emitter;
 use metafuse_catalog_storage::{CatalogBackend, LocalSqliteBackend};
+use serde_json;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -409,4 +410,265 @@ fn test_idempotent_emission() {
         .unwrap();
 
     assert_eq!(count, 1);
+}
+
+#[test]
+fn test_fts_search() {
+    let (_temp_dir, backend) = create_test_backend();
+    let emitter = Emitter::new(backend.clone());
+    let schema = create_sample_schema();
+
+    // Emit multiple datasets with searchable content
+    emitter
+        .emit_dataset(
+            "transactions_daily",
+            "/data/transactions.parquet",
+            "parquet",
+            Some("Daily transaction data from payment system"),
+            Some("prod"),
+            Some("finance"),
+            Some("finance@example.com"),
+            schema.clone(),
+            None,
+            vec![],
+            vec!["daily".to_string(), "transactions".to_string()],
+        )
+        .unwrap();
+
+    emitter
+        .emit_dataset(
+            "users_profile",
+            "/data/users.parquet",
+            "parquet",
+            Some("User profile information"),
+            Some("prod"),
+            Some("analytics"),
+            Some("analytics@example.com"),
+            schema.clone(),
+            None,
+            vec![],
+            vec!["users".to_string(), "profile".to_string()],
+        )
+        .unwrap();
+
+    let conn = backend.get_connection().unwrap();
+
+    // Search for "transactions" should find the transactions dataset
+    let mut stmt = conn
+        .prepare(
+            "SELECT dataset_name FROM dataset_search \
+             WHERE dataset_search MATCH ?1",
+        )
+        .unwrap();
+
+    let results: Vec<String> = stmt
+        .query_map(["transactions"], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(results, vec!["transactions_daily"]);
+
+    // Search for "user" should find the users dataset
+    let results: Vec<String> = stmt
+        .query_map(["user"], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(results, vec!["users_profile"]);
+
+    // Search for "finance" should find transactions (by domain)
+    let results: Vec<String> = stmt
+        .query_map(["finance"], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(results, vec!["transactions_daily"]);
+}
+
+#[test]
+fn test_partition_keys() {
+    let (_temp_dir, backend) = create_test_backend();
+    let emitter = Emitter::new(backend.clone());
+    let schema = create_sample_schema();
+
+    // Emit dataset with partition keys
+    emitter
+        .emit_dataset(
+            "partitioned_dataset",
+            "/data/partitioned.parquet",
+            "parquet",
+            Some("Partitioned dataset"),
+            Some("prod"),
+            Some("analytics"),
+            Some("team@example.com"),
+            schema,
+            Some(OperationalMeta {
+                row_count: Some(1_000_000),
+                size_bytes: Some(500_000_000),
+                partition_keys: vec!["year".to_string(), "month".to_string(), "day".to_string()],
+            }),
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+    let conn = backend.get_connection().unwrap();
+
+    // Verify partition keys are stored as JSON
+    let partition_keys_json: String = conn
+        .query_row(
+            "SELECT partition_keys FROM datasets WHERE name = ?1",
+            ["partitioned_dataset"],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    // Parse JSON and verify structure
+    let partition_keys: Vec<String> = serde_json::from_str(&partition_keys_json).unwrap();
+    assert_eq!(
+        partition_keys,
+        vec!["year".to_string(), "month".to_string(), "day".to_string()]
+    );
+}
+
+#[test]
+fn test_domain_filtering() {
+    let (_temp_dir, backend) = create_test_backend();
+    let emitter = Emitter::new(backend.clone());
+    let schema = create_sample_schema();
+
+    // Create datasets across different domains
+    emitter
+        .emit_dataset(
+            "finance_dataset_1",
+            "/data/finance1.parquet",
+            "parquet",
+            Some("Finance data 1"),
+            Some("prod"),
+            Some("finance"),
+            Some("finance@example.com"),
+            schema.clone(),
+            None,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+    emitter
+        .emit_dataset(
+            "finance_dataset_2",
+            "/data/finance2.parquet",
+            "parquet",
+            Some("Finance data 2"),
+            Some("prod"),
+            Some("finance"),
+            Some("finance@example.com"),
+            schema.clone(),
+            None,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+    emitter
+        .emit_dataset(
+            "analytics_dataset",
+            "/data/analytics.parquet",
+            "parquet",
+            Some("Analytics data"),
+            Some("prod"),
+            Some("analytics"),
+            Some("analytics@example.com"),
+            schema.clone(),
+            None,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+    let conn = backend.get_connection().unwrap();
+
+    // Query datasets by domain
+    let finance_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM datasets WHERE domain = 'finance'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    let analytics_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM datasets WHERE domain = 'analytics'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(finance_count, 2);
+    assert_eq!(analytics_count, 1);
+
+    // Verify domain names
+    let mut stmt = conn
+        .prepare("SELECT name FROM datasets WHERE domain = ?1 ORDER BY name")
+        .unwrap();
+
+    let finance_datasets: Vec<String> = stmt
+        .query_map(["finance"], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(
+        finance_datasets,
+        vec!["finance_dataset_1", "finance_dataset_2"]
+    );
+}
+
+#[test]
+fn test_operational_metadata() {
+    let (_temp_dir, backend) = create_test_backend();
+    let emitter = Emitter::new(backend.clone());
+    let schema = create_sample_schema();
+
+    // Emit dataset with full operational metadata
+    emitter
+        .emit_dataset(
+            "ops_metadata_dataset",
+            "/data/ops.parquet",
+            "parquet",
+            Some("Dataset with operational metadata"),
+            Some("prod"),
+            Some("analytics"),
+            Some("team@example.com"),
+            schema,
+            Some(OperationalMeta {
+                row_count: Some(5_000_000),
+                size_bytes: Some(2_500_000_000),
+                partition_keys: vec!["region".to_string(), "date".to_string()],
+            }),
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+    let conn = backend.get_connection().unwrap();
+
+    // Verify all operational metadata fields
+    let (row_count, size_bytes, partition_keys_json): (Option<i64>, Option<i64>, Option<String>) =
+        conn.query_row(
+            "SELECT row_count, size_bytes, partition_keys FROM datasets WHERE name = ?1",
+            ["ops_metadata_dataset"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+
+    assert_eq!(row_count, Some(5_000_000));
+    assert_eq!(size_bytes, Some(2_500_000_000));
+
+    let partition_keys: Vec<String> = serde_json::from_str(&partition_keys_json.unwrap()).unwrap();
+    assert_eq!(partition_keys, vec!["region", "date"]);
 }
