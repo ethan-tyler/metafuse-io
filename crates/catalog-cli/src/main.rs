@@ -3,7 +3,7 @@
 //! Command-line interface for exploring and managing the MetaFuse catalog.
 
 use clap::{Parser, Subcommand};
-use metafuse_catalog_storage::{CatalogBackend, LocalSqliteBackend};
+use metafuse_catalog_storage::backend_from_uri;
 
 #[derive(Parser)]
 #[command(name = "metafuse")]
@@ -83,7 +83,7 @@ fn main() {
 }
 
 fn init_catalog(path: &str, force: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let backend = LocalSqliteBackend::new(path);
+    let backend = backend_from_uri(path)?;
 
     if backend.exists()? {
         if !force {
@@ -109,7 +109,7 @@ fn list_datasets(
     domain: Option<String>,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let backend = LocalSqliteBackend::new(path);
+    let backend = backend_from_uri(path)?;
     let conn = backend.get_connection()?;
 
     let mut query = String::from(
@@ -208,7 +208,7 @@ fn show_dataset(
     name: &str,
     show_lineage: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let backend = LocalSqliteBackend::new(path);
+    let backend = backend_from_uri(path)?;
     let conn = backend.get_connection()?;
 
     // Get dataset info
@@ -343,7 +343,7 @@ fn show_dataset(
 }
 
 fn search_datasets(path: &str, query: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let backend = LocalSqliteBackend::new(path);
+    let backend = backend_from_uri(path)?;
     let conn = backend.get_connection()?;
 
     let mut stmt = conn.prepare(
@@ -381,7 +381,7 @@ fn search_datasets(path: &str, query: &str) -> Result<(), Box<dyn std::error::Er
 }
 
 fn show_stats(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let backend = LocalSqliteBackend::new(path);
+    let backend = backend_from_uri(path)?;
     let conn = backend.get_connection()?;
 
     let dataset_count: i64 =

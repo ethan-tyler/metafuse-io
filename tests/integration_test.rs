@@ -6,12 +6,10 @@
 // - Multi-tenant isolation
 // - Lineage tracking
 
-use datafusion::arrow::array::{Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::arrow::record_batch::RecordBatch;
-use metafuse_catalog_core::init_sqlite_schema;
+use metafuse_catalog_core::{init_sqlite_schema, OperationalMeta};
 use metafuse_catalog_emitter::Emitter;
-use metafuse_catalog_storage::LocalSqliteBackend;
+use metafuse_catalog_storage::{CatalogBackend, LocalSqliteBackend};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -54,8 +52,11 @@ fn test_emit_and_query_dataset() {
             Some("test_domain"),
             Some("test@example.com"),
             schema,
-            Some(100),
-            Some(50_000),
+            Some(OperationalMeta {
+                row_count: Some(100),
+                size_bytes: Some(50_000),
+                partition_keys: vec![],
+            }),
             vec![],
             vec!["test".to_string()],
         )
@@ -121,7 +122,6 @@ fn test_lineage_tracking() {
             Some("team@example.com"),
             schema.clone(),
             None,
-            None,
             vec![],
             vec![],
         )
@@ -137,7 +137,6 @@ fn test_lineage_tracking() {
             Some("analytics"),
             Some("team@example.com"),
             schema.clone(),
-            None,
             None,
             vec!["parent_dataset".to_string()],
             vec![],
@@ -176,7 +175,6 @@ fn test_multi_tenant_isolation() {
             Some("team_a@example.com"),
             schema.clone(),
             None,
-            None,
             vec![],
             vec![],
         )
@@ -193,7 +191,6 @@ fn test_multi_tenant_isolation() {
             Some("team_b@example.com"),
             schema.clone(),
             None,
-            None,
             vec![],
             vec![],
         )
@@ -201,14 +198,18 @@ fn test_multi_tenant_isolation() {
 
     let conn = backend.get_connection().unwrap();
     let count_a: i64 = conn
-        .query_row("SELECT COUNT(*) FROM datasets WHERE tenant = 'tenant_a'", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT COUNT(*) FROM datasets WHERE tenant = 'tenant_a'",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     let count_b: i64 = conn
-        .query_row("SELECT COUNT(*) FROM datasets WHERE tenant = 'tenant_b'", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT COUNT(*) FROM datasets WHERE tenant = 'tenant_b'",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
 
     assert_eq!(count_a, 1);
@@ -231,8 +232,11 @@ fn test_upsert_dataset() {
             Some("analytics"),
             Some("team@example.com"),
             schema.clone(),
-            Some(100),
-            None,
+            Some(OperationalMeta {
+                row_count: Some(100),
+                size_bytes: None,
+                partition_keys: vec![],
+            }),
             vec![],
             vec!["v1".to_string()],
         )
@@ -248,8 +252,11 @@ fn test_upsert_dataset() {
             Some("analytics"),
             Some("team@example.com"),
             schema.clone(),
-            Some(200),
-            None,
+            Some(OperationalMeta {
+                row_count: Some(200),
+                size_bytes: None,
+                partition_keys: vec![],
+            }),
             vec![],
             vec!["v2".to_string()],
         )
@@ -286,9 +293,12 @@ fn test_tags() {
             Some("team@example.com"),
             schema,
             None,
-            None,
             vec![],
-            vec!["prod".to_string(), "important".to_string(), "daily".to_string()],
+            vec![
+                "prod".to_string(),
+                "important".to_string(),
+                "daily".to_string(),
+            ],
         )
         .unwrap();
 
@@ -328,7 +338,6 @@ fn test_schema_fields() {
             None,
             schema,
             None,
-            None,
             vec![],
             vec![],
         )
@@ -356,7 +365,10 @@ fn test_schema_fields() {
     assert_eq!(fields.len(), 3);
     assert_eq!(fields[0], ("id".to_string(), "Int64".to_string(), false));
     assert_eq!(fields[1], ("name".to_string(), "Utf8".to_string(), true));
-    assert_eq!(fields[2], ("value".to_string(), "Float64".to_string(), true));
+    assert_eq!(
+        fields[2],
+        ("value".to_string(), "Float64".to_string(), true)
+    );
 }
 
 #[test]
@@ -376,8 +388,11 @@ fn test_idempotent_emission() {
                 Some("analytics"),
                 Some("team@example.com"),
                 schema.clone(),
-                Some(100),
-                None,
+                Some(OperationalMeta {
+                    row_count: Some(100),
+                    size_bytes: None,
+                    partition_keys: vec![],
+                }),
                 vec![],
                 vec!["test".to_string()],
             )

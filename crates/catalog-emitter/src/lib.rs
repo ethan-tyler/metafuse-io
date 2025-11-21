@@ -4,8 +4,14 @@
 
 use chrono::Utc;
 use datafusion::arrow::datatypes::SchemaRef;
-use metafuse_catalog_core::{DatasetMeta, FieldMeta, Result};
+use metafuse_catalog_core::{
+    get_catalog_version, increment_catalog_version, init_sqlite_schema, CatalogError, DatasetMeta,
+    FieldMeta, OperationalMeta, Result,
+};
 use metafuse_catalog_storage::CatalogBackend;
+use rusqlite::Connection;
+use std::thread;
+use std::time::Duration;
 
 /// Emitter API for capturing metadata from DataFusion pipelines
 ///
@@ -16,6 +22,7 @@ use metafuse_catalog_storage::CatalogBackend;
 /// ```ignore
 /// use metafuse_catalog_emitter::Emitter;
 /// use metafuse_catalog_storage::LocalSqliteBackend;
+/// use metafuse_catalog_core::OperationalMeta;
 ///
 /// let backend = LocalSqliteBackend::new("catalog.db");
 /// let emitter = Emitter::new(backend);
@@ -25,12 +32,16 @@ use metafuse_catalog_storage::CatalogBackend;
 ///     "my_dataset",
 ///     "s3://bucket/path/to/data",
 ///     "parquet",
+///     Some("Description of dataset"),
 ///     Some("prod-tenant"),
 ///     Some("analytics"),
 ///     Some("data-team@company.com"),
 ///     schema,
-///     Some(1_000_000),
-///     Some(50_000_000),
+///     Some(OperationalMeta {
+///         row_count: Some(1_000_000),
+///         size_bytes: Some(50_000_000),
+///         partition_keys: vec!["year".to_string(), "month".to_string()],
+///     }),
 ///     vec!["upstream_dataset_1".to_string()],
 ///     vec!["pii".to_string(), "daily".to_string()],
 /// )?;
@@ -59,8 +70,7 @@ impl<B: CatalogBackend> Emitter<B> {
     /// * `domain` - Optional business domain ("finance", "marketing", etc.)
     /// * `owner` - Optional owner/responsible party
     /// * `schema` - DataFusion Arrow schema
-    /// * `row_count` - Optional approximate row count
-    /// * `size_bytes` - Optional size in bytes
+    /// * `operational` - Optional operational metadata (row count, size, partition keys)
     /// * `upstream_datasets` - List of upstream dataset names this depends on
     /// * `tags` - Tags for categorization and discovery
     #[allow(clippy::too_many_arguments)]
@@ -74,8 +84,7 @@ impl<B: CatalogBackend> Emitter<B> {
         domain: Option<&str>,
         owner: Option<&str>,
         schema: SchemaRef,
-        row_count: Option<i64>,
-        size_bytes: Option<i64>,
+        operational: Option<OperationalMeta>,
         upstream_datasets: Vec<String>,
         tags: Vec<String>,
     ) -> Result<()> {
@@ -103,11 +112,10 @@ impl<B: CatalogBackend> Emitter<B> {
             owner: owner.map(|s| s.to_string()),
             created_at: now,
             last_updated: now,
-            row_count,
-            size_bytes,
             fields,
             upstream_datasets,
             tags,
+            operational,
         };
 
         self.write_dataset(&dataset)?;
@@ -115,17 +123,115 @@ impl<B: CatalogBackend> Emitter<B> {
         Ok(())
     }
 
-    /// Write dataset metadata to the catalog
+    /// Write dataset metadata to the catalog with optimistic concurrency control
+    ///
+    /// This implements the download-modify-upload pattern with retry logic:
+    /// 1. Download catalog from backend (captures current version)
+    /// 2. Perform writes in a transaction
+    /// 3. Validate catalog version was incremented
+    /// 4. Upload modified catalog with version preconditions
+    /// 5. If upload fails due to conflict, retry with exponential backoff
     fn write_dataset(&self, dataset: &DatasetMeta) -> Result<()> {
-        let mut conn = self.backend.get_connection()?;
+        const MAX_RETRIES: u32 = 3;
+        let mut retry_count = 0;
 
-        let tx = conn.transaction()?;
+        loop {
+            // Download catalog (captures current version and remote metadata)
+            let download = self.backend.download()?;
+            let expected_version = download.catalog_version;
+
+            tracing::debug!(
+                dataset = %dataset.name,
+                version = expected_version,
+                "Downloaded catalog for write"
+            );
+
+            // Open connection to the downloaded catalog
+            let mut conn = Connection::open(&download.path)?;
+            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            init_sqlite_schema(&conn)?;
+
+            // Perform all writes in a transaction
+            let tx = conn.transaction()?;
+            self.write_dataset_tx(&tx, dataset)?;
+            tx.commit()?;
+
+            // Verify version was incremented (sanity check)
+            let new_version = get_catalog_version(&conn)?;
+            if new_version <= expected_version {
+                return Err(CatalogError::Other(format!(
+                    "Catalog version not incremented: expected > {}, got {}",
+                    expected_version, new_version
+                )));
+            }
+
+            tracing::debug!(
+                dataset = %dataset.name,
+                old_version = expected_version,
+                new_version = new_version,
+                "Catalog version incremented"
+            );
+
+            // Upload the modified catalog with optimistic locking
+            match self.backend.upload(&download) {
+                Ok(()) => {
+                    tracing::info!(
+                        dataset = %dataset.name,
+                        version = new_version,
+                        "Dataset metadata emitted successfully"
+                    );
+                    return Ok(());
+                }
+                Err(CatalogError::ConflictError(msg)) if retry_count < MAX_RETRIES => {
+                    retry_count += 1;
+                    // Exponential backoff: 100ms, 200ms, 400ms
+                    let backoff_ms = 100 * 2_u64.pow(retry_count - 1);
+                    tracing::warn!(
+                        dataset = %dataset.name,
+                        retry = retry_count,
+                        max_retries = MAX_RETRIES,
+                        backoff_ms = backoff_ms,
+                        error = %msg,
+                        "Catalog conflict detected, retrying..."
+                    );
+                    thread::sleep(Duration::from_millis(backoff_ms));
+                    // Loop will retry with fresh download
+                }
+                Err(CatalogError::ConflictError(msg)) => {
+                    return Err(CatalogError::ConflictError(format!(
+                        "Failed after {} retries: {}",
+                        MAX_RETRIES, msg
+                    )));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Perform dataset writes within a transaction
+    fn write_dataset_tx(&self, tx: &rusqlite::Transaction, dataset: &DatasetMeta) -> Result<()> {
+        // Extract operational metadata
+        let (row_count, size_bytes, partition_keys_json) = if let Some(ref op) = dataset.operational
+        {
+            let partition_keys_json = if op.partition_keys.is_empty() {
+                None
+            } else {
+                // Store as JSON array for proper structure and no delimiter issues
+                Some(
+                    serde_json::to_string(&op.partition_keys)
+                        .map_err(|e| CatalogError::SerializationError(e.to_string()))?,
+                )
+            };
+            (op.row_count, op.size_bytes, partition_keys_json)
+        } else {
+            (None, None, None)
+        };
 
         // Insert or update dataset
         tx.execute(
             r#"
-            INSERT INTO datasets (name, path, format, description, tenant, domain, owner, created_at, last_updated, row_count, size_bytes)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            INSERT INTO datasets (name, path, format, description, tenant, domain, owner, created_at, last_updated, row_count, size_bytes, partition_keys)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ON CONFLICT(name) DO UPDATE SET
                 path = excluded.path,
                 format = excluded.format,
@@ -135,7 +241,8 @@ impl<B: CatalogBackend> Emitter<B> {
                 owner = excluded.owner,
                 last_updated = excluded.last_updated,
                 row_count = excluded.row_count,
-                size_bytes = excluded.size_bytes
+                size_bytes = excluded.size_bytes,
+                partition_keys = excluded.partition_keys
             "#,
             rusqlite::params![
                 dataset.name,
@@ -147,8 +254,9 @@ impl<B: CatalogBackend> Emitter<B> {
                 dataset.owner,
                 dataset.created_at.to_rfc3339(),
                 dataset.last_updated.to_rfc3339(),
-                dataset.row_count,
-                dataset.size_bytes,
+                row_count,
+                size_bytes,
+                partition_keys_json,
             ],
         )?;
 
@@ -213,39 +321,11 @@ impl<B: CatalogBackend> Emitter<B> {
             )?;
         }
 
-        // Refresh FTS index entry for this dataset
-        tx.execute(
-            "DELETE FROM dataset_search WHERE dataset_name = ?1",
-            [&dataset.name],
-        )?;
+        // NOTE: FTS index is automatically maintained by triggers on datasets/fields/tags tables.
+        // No manual dataset_search insert/delete needed here.
 
-        let field_names = dataset
-            .fields
-            .iter()
-            .map(|f| f.name.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let tag_string = dataset.tags.join(" ");
-
-        tx.execute(
-            r#"
-            INSERT INTO dataset_search (dataset_name, path, domain, owner, description, tags, field_names)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            "#,
-            rusqlite::params![
-                dataset.name,
-                dataset.path,
-                dataset.domain,
-                dataset.owner,
-                dataset.description,
-                tag_string,
-                field_names
-            ],
-        )?;
-
-        // Commit transaction
-        tx.commit()?;
+        // Increment catalog version for optimistic concurrency control
+        increment_catalog_version(tx)?;
 
         Ok(())
     }
@@ -286,8 +366,11 @@ mod tests {
                 Some("analytics"),
                 Some("test@example.com"),
                 schema,
-                Some(1000),
-                Some(50000),
+                Some(OperationalMeta {
+                    row_count: Some(1000),
+                    size_bytes: Some(50000),
+                    partition_keys: vec!["date".to_string()],
+                }),
                 vec![],
                 vec!["test".to_string(), "sample".to_string()],
             )
@@ -311,6 +394,16 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))
             .unwrap();
         assert_eq!(tag_count, 2);
+
+        // Verify partition keys were written as JSON
+        let partition_keys: Option<String> = conn
+            .query_row(
+                "SELECT partition_keys FROM datasets WHERE name = ?1",
+                ["test_dataset"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(partition_keys, Some(r#"["date"]"#.to_string()));
     }
 
     #[test]
@@ -333,7 +426,6 @@ mod tests {
                 None,
                 schema.clone(),
                 None,
-                None,
                 vec![],
                 vec![],
             )
@@ -350,7 +442,6 @@ mod tests {
                 None,
                 None,
                 schema,
-                None,
                 None,
                 vec!["upstream".to_string()],
                 vec![],

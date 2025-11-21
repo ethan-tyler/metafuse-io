@@ -11,6 +11,7 @@ description = "Storage backend abstraction for MetaFuse catalog"
 metafuse-catalog-core = { path = "../catalog-core" }
 rusqlite.workspace = true
 thiserror.workspace = true
+tempfile.workspace = true
 
 # Future: GCS/S3 client libraries
 # google-cloud-storage = { version = "0.15", optional = true }
