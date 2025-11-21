@@ -42,9 +42,7 @@ struct DatasetResponse {
     owner: Option<String>,
     created_at: String,
     last_updated: String,
-    row_count: Option<i64>,
-    size_bytes: Option<i64>,
-    partition_keys: Vec<String>,
+    operational: OperationalMetaResponse,
 }
 
 /// Field response structure
@@ -67,6 +65,13 @@ struct DatasetDetailResponse {
     downstream_datasets: Vec<String>,
 }
 
+/// Operational metadata response
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct OperationalMetaResponse {
+    row_count: Option<i64>,
+    size_bytes: Option<i64>,
+    partition_keys: Vec<String>,
+}
 /// Error response
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
@@ -174,6 +179,9 @@ async fn list_datasets(
 
     let datasets = stmt
         .query_map(params_from_iter(bindings.iter()), |row| {
+            let row_count: Option<i64> = row.get(10)?;
+            let size_bytes: Option<i64> = row.get(11)?;
+            let partition_keys = parse_partition_keys(row.get::<_, Option<String>>(12)?);
             Ok(DatasetResponse {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -185,9 +193,11 @@ async fn list_datasets(
                 owner: row.get(7)?,
                 created_at: row.get(8)?,
                 last_updated: row.get(9)?,
-                row_count: row.get(10)?,
-                size_bytes: row.get(11)?,
-                partition_keys: parse_partition_keys(row.get::<_, Option<String>>(12)?),
+                operational: OperationalMetaResponse {
+                    row_count,
+                    size_bytes,
+                    partition_keys,
+                },
             })
         })
         .map_err(|e| internal_error(e.to_string()))?
@@ -218,6 +228,9 @@ async fn get_dataset(
         "#,
             [&name],
             |row| {
+                let row_count: Option<i64> = row.get(10)?;
+                let size_bytes: Option<i64> = row.get(11)?;
+                let partition_keys = parse_partition_keys(row.get::<_, Option<String>>(12)?);
                 Ok(DatasetResponse {
                     id: row.get(0)?,
                     name: row.get(1)?,
@@ -229,9 +242,11 @@ async fn get_dataset(
                     owner: row.get(7)?,
                     created_at: row.get(8)?,
                     last_updated: row.get(9)?,
-                    row_count: row.get(10)?,
-                    size_bytes: row.get(11)?,
-                    partition_keys: parse_partition_keys(row.get::<_, Option<String>>(12)?),
+                    operational: OperationalMetaResponse {
+                        row_count,
+                        size_bytes,
+                        partition_keys,
+                    },
                 })
             },
         )
@@ -340,6 +355,9 @@ async fn search_datasets(
 
     let datasets = stmt
         .query_map([query], |row| {
+            let row_count: Option<i64> = row.get(10)?;
+            let size_bytes: Option<i64> = row.get(11)?;
+            let partition_keys = parse_partition_keys(row.get::<_, Option<String>>(12)?);
             Ok(DatasetResponse {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -351,9 +369,11 @@ async fn search_datasets(
                 owner: row.get(7)?,
                 created_at: row.get(8)?,
                 last_updated: row.get(9)?,
-                row_count: row.get(10)?,
-                size_bytes: row.get(11)?,
-                partition_keys: parse_partition_keys(row.get::<_, Option<String>>(12)?),
+                operational: OperationalMetaResponse {
+                    row_count,
+                    size_bytes,
+                    partition_keys,
+                },
             })
         })
         .map_err(|e| internal_error(e.to_string()))?
