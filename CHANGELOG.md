@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2025-01-22
+
+**Quality & Compliance Release** - Patch release with lint enforcement and benchmark fixes.
+
+### Added
+
+- **Async Safety Lints**
+  - `clippy::await_holding_lock = "warn"` - Prevents holding locks across await points
+  - `unsafe_code = "forbid"` - Enforces memory safety guarantees
+  - Completes async safety enforcement from v0.4.0 plan
+
+### Fixed
+
+- **Benchmark Suite**
+  - Converted all benchmarks to async/await pattern
+  - Benchmarks now compile and run with v0.4.0 async API
+  - Use `criterion::to_async()` with tokio runtime
+  - 5 benchmarks updated: emit_dataset (minimal/full/lineage), fts_search (simple/filtered)
+
+- **Documentation**
+  - Fixed migration guide to show manual `Pin<Box<dyn Future>>` pattern
+  - Removed all `async_trait` references (not used in implementation)
+  - Updated legacy adapter docs to reference v0.4.0 instead of v0.3.2
+  - Improved inline examples with correct async patterns
+
+### Migration Notes
+
+No migration required - this is a **non-breaking patch release**. All v0.4.0 code continues to work unchanged.
+
+**For benchmark users:** Update benchmarks to use async pattern (see migration guide).
+
+---
+
 ## [0.4.0] - 2025-01-22
 
 **Async/Await Migration Release** - Breaking release introducing async APIs throughout the codebase.
@@ -453,7 +486,10 @@ See `MIGRATION_v0.4.0.md` for detailed migration instructions.
 
 ---
 
-[Unreleased]: https://github.com/ethan-tyler/MetaFuse/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ethan-tyler/MetaFuse/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/ethan-tyler/MetaFuse/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/ethan-tyler/MetaFuse/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/ethan-tyler/MetaFuse/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ethan-tyler/MetaFuse/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ethan-tyler/MetaFuse/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ethan-tyler/MetaFuse/releases/tag/v0.1.0

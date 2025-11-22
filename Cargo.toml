@@ -22,11 +22,15 @@ license = "Apache-2.0"
 authors = ["Ethan Urbanski <ethan@urbanskitech.com>"]
 repository = "https://github.com/ethan-tyler/MetaFuse"
 description = "MetaFuse: a lightweight, serverless data catalog for DataFusion and lakehouse pipelines."
-version = "0.4.0"
+version = "0.4.1"
 
 [workspace.lints.clippy]
+await_holding_lock = "warn"
 await_holding_refcell = "warn"
 large_futures = "warn"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
 
 [workspace.dependencies]
 # Core dependencies
@@ -61,7 +65,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 tempfile = "3"
 
 # Benchmarking
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 
 [dev-dependencies]
 tempfile = "3"

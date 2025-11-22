@@ -21,7 +21,7 @@
 //!
 //! This module requires the `legacy-sync` feature flag:
 //! ```toml
-//! metafuse-catalog-storage = { version = "0.3.2", features = ["legacy-sync"] }
+//! metafuse-catalog-storage = { version = "0.4.0", features = ["legacy-sync"] }
 //! ```
 
 use crate::{CatalogBackend, CatalogDownload, Result};
@@ -29,7 +29,7 @@ use rusqlite::Connection;
 
 /// Synchronous adapter for async CatalogBackend
 ///
-/// **DEPRECATED since v0.3.2**: This adapter provides temporary backward compatibility
+/// **DEPRECATED since v0.4.0**: This adapter provides temporary backward compatibility
 /// for code that hasn't migrated to async yet. It will be removed in v0.5.0.
 ///
 /// ## Performance Warning
@@ -50,7 +50,7 @@ use rusqlite::Connection;
 /// adapter.upload_blocking(&download)?;
 /// ```
 #[deprecated(
-    since = "0.3.2",
+    since = "0.4.0",
     note = "Use async CatalogBackend methods directly. Removal in v0.5.0"
 )]
 pub struct SyncBackendAdapter<B: CatalogBackend> {
@@ -64,7 +64,7 @@ impl<B: CatalogBackend> SyncBackendAdapter<B> {
     ///
     /// **DEPRECATED**: Migrate to async/await instead.
     #[deprecated(
-        since = "0.3.2",
+        since = "0.4.0",
         note = "Use async CatalogBackend methods directly. Removal in v0.5.0"
     )]
     pub fn new(backend: B) -> Result<Self> {
@@ -84,7 +84,7 @@ impl<B: CatalogBackend> SyncBackendAdapter<B> {
     /// Download catalog synchronously
     ///
     /// **DEPRECATED**: Use `backend.download().await` instead.
-    #[deprecated(since = "0.3.2", note = "Use backend.download().await")]
+    #[deprecated(since = "0.4.0", note = "Use backend.download().await")]
     pub fn download_blocking(&self) -> Result<CatalogDownload> {
         self.runtime.block_on(self.backend.download())
     }
@@ -92,7 +92,7 @@ impl<B: CatalogBackend> SyncBackendAdapter<B> {
     /// Upload catalog synchronously
     ///
     /// **DEPRECATED**: Use `backend.upload(&download).await` instead.
-    #[deprecated(since = "0.3.2", note = "Use backend.upload(&download).await")]
+    #[deprecated(since = "0.4.0", note = "Use backend.upload(&download).await")]
     pub fn upload_blocking(&self, download: &CatalogDownload) -> Result<()> {
         self.runtime.block_on(self.backend.upload(download))
     }
@@ -100,7 +100,7 @@ impl<B: CatalogBackend> SyncBackendAdapter<B> {
     /// Get connection synchronously
     ///
     /// **DEPRECATED**: Use `backend.get_connection().await` instead.
-    #[deprecated(since = "0.3.2", note = "Use backend.get_connection().await")]
+    #[deprecated(since = "0.4.0", note = "Use backend.get_connection().await")]
     pub fn get_connection_blocking(&self) -> Result<Connection> {
         self.runtime.block_on(self.backend.get_connection())
     }
@@ -108,7 +108,7 @@ impl<B: CatalogBackend> SyncBackendAdapter<B> {
     /// Check if catalog exists synchronously
     ///
     /// **DEPRECATED**: Use `backend.exists().await` instead.
-    #[deprecated(since = "0.3.2", note = "Use backend.exists().await")]
+    #[deprecated(since = "0.4.0", note = "Use backend.exists().await")]
     pub fn exists_blocking(&self) -> Result<bool> {
         self.runtime.block_on(self.backend.exists())
     }
@@ -116,7 +116,7 @@ impl<B: CatalogBackend> SyncBackendAdapter<B> {
     /// Initialize catalog synchronously
     ///
     /// **DEPRECATED**: Use `backend.initialize().await` instead.
-    #[deprecated(since = "0.3.2", note = "Use backend.initialize().await")]
+    #[deprecated(since = "0.4.0", note = "Use backend.initialize().await")]
     pub fn initialize_blocking(&self) -> Result<()> {
         self.runtime.block_on(self.backend.initialize())
     }
