@@ -13,9 +13,10 @@ path = "src/main.rs"
 
 [dependencies]
 metafuse-catalog-core = { path = "../catalog-core" }
-metafuse-catalog-storage = { path = "../catalog-storage" }
+metafuse-catalog-storage = { path = "../catalog-storage", features = ["legacy-sync"] }
 
 clap.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 rusqlite.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }

@@ -85,23 +85,25 @@ async fn main() -> Result<()> {
     let backend = LocalSqliteBackend::new("metafuse_catalog.db");
     let emitter = Emitter::new(backend);
 
-    emitter.emit_dataset(
-        "sample_dataset",
-        "/tmp/sample_data.parquet",
-        "parquet",
-        Some("Sample dataset for getting started with MetaFuse"),
-        Some("dev"),
-        Some("analytics"),
-        Some("example@metafuse.dev"),
-        result_schema,
-        Some(OperationalMeta {
-            row_count: Some(row_count as i64),
-            size_bytes: None,
-            partition_keys: vec![],
-        }),
-        vec![], // No upstream dependencies
-        vec!["example".to_string(), "tutorial".to_string()],
-    )?;
+    emitter
+        .emit_dataset(
+            "sample_dataset",
+            "/tmp/sample_data.parquet",
+            "parquet",
+            Some("Sample dataset for getting started with MetaFuse"),
+            Some("dev"),
+            Some("analytics"),
+            Some("example@metafuse.dev"),
+            result_schema,
+            Some(OperationalMeta {
+                row_count: Some(row_count as i64),
+                size_bytes: None,
+                partition_keys: vec![],
+            }),
+            vec![], // No upstream dependencies
+            vec!["example".to_string(), "tutorial".to_string()],
+        )
+        .await?;
 
     println!("   Metadata emitted: sample_dataset");
 

@@ -10,13 +10,13 @@
 
 #[cfg(all(test, feature = "s3"))]
 mod tests {
-    use metafuse_catalog_core::CatalogError;
+    use metafuse_catalog_core::{CatalogError, DatasetMeta, FieldMeta};
     use metafuse_catalog_storage::{CatalogBackend, S3Backend};
     use std::net::TcpStream;
     use std::process::Command;
     use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
-    use testcontainers::{clients::Cli, core::WaitFor, GenericImage};
+    use testcontainers::{clients::Cli, images::generic::GenericImage, RunnableImage};
 
     // Serialize tests to avoid env var collisions and emulator port reuse.
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -65,19 +65,22 @@ mod tests {
     }
 
     /// Create a test S3 backend with MinIO emulator
-    fn setup_s3_backend<'a>(
-        docker: &'a Cli,
+    fn setup_s3_backend(
+        docker: &Cli,
         bucket_name: &str,
         object_key: &str,
-    ) -> (impl Drop + 'a, S3Backend) {
+    ) -> (impl Drop, S3Backend) {
         // Start MinIO container
         let minio_image = GenericImage::new("minio/minio", "latest")
             .with_exposed_port(9000)
             .with_env_var("MINIO_ROOT_USER", "minioadmin")
             .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
-            .with_wait_for(WaitFor::message_on_stdout("API:"));
+            .with_wait_for(testcontainers::core::WaitFor::message_on_stdout("API:"));
 
-        let minio_container = docker.run(minio_image);
+        let minio_container = docker.run(
+            RunnableImage::from(minio_image)
+                .with_args(vec!["server".to_string(), "/data".to_string()]),
+        );
         let minio_port = minio_container.get_host_port_ipv4(9000);
 
         // Wait for readiness
@@ -127,7 +130,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_s3_initialize_catalog() {
+    fn test_s3_initialize_catalog() {
         let _guard = match test_guard("test_s3_initialize_catalog") {
             Some(g) => g,
             None => return,
@@ -139,10 +142,7 @@ mod tests {
         assert!(backend.initialize().await.is_ok());
 
         // Second initialize should fail (already exists)
-        assert!(matches!(
-            backend.initialize().await,
-            Err(CatalogError::Other(_))
-        ));
+        assert!(matches!(backend.initialize().await, Err(CatalogError::Other(_))));
 
         // Cleanup
         std::env::remove_var("AWS_ACCESS_KEY_ID");
@@ -153,7 +153,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_s3_exists_check() {
+    fn test_s3_exists_check() {
         let _guard = match test_guard("test_s3_exists_check") {
             Some(g) => g,
             None => return,
@@ -179,7 +179,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_s3_upload_download_roundtrip() {
+    fn test_s3_upload_download_roundtrip() {
         let _guard = match test_guard("test_s3_upload_download_roundtrip") {
             Some(g) => g,
             None => return,
@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_s3_not_found_handling() {
+    fn test_s3_not_found_handling() {
         let _guard = match test_guard("test_s3_not_found_handling") {
             Some(g) => g,
             None => return,
@@ -237,7 +237,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_s3_get_connection() {
+    fn test_s3_get_connection() {
         let _guard = match test_guard("test_s3_get_connection") {
             Some(g) => g,
             None => return,
@@ -267,7 +267,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_s3_concurrent_write_detection() {
+    fn test_s3_concurrent_write_detection() {
         let _guard = match test_guard("test_s3_concurrent_write_detection") {
             Some(g) => g,
             None => return,
@@ -276,10 +276,10 @@ mod tests {
         let (_container, backend1) = setup_s3_backend(&docker, "test-bucket", "catalog.db");
 
         // Initialize catalog
-        backend1.initialize().await.unwrap();
+        backend1.initialize().unwrap();
 
         // First download
-        let download1 = backend1.download().await.unwrap();
+        let download1 = backend1.download().unwrap();
         let etag1 = download1
             .remote_version
             .as_ref()
@@ -289,14 +289,14 @@ mod tests {
             .unwrap();
 
         // Simulate concurrent modification: upload to change ETag
-        backend1.upload(&download1).await.unwrap();
+        backend1.upload(&download1).unwrap();
 
         // Second backend with same bucket/object
         let backend2 = S3Backend::new("test-bucket", "catalog.db", "us-east-1")
             .expect("Failed to create backend2");
 
         // Second download gets new ETag
-        let download2 = backend2.download().await.unwrap();
+        let download2 = backend2.download().unwrap();
         let etag2 = download2
             .remote_version
             .as_ref()
@@ -309,7 +309,7 @@ mod tests {
         assert_ne!(etag1, etag2, "ETags should differ after upload");
 
         // Try to upload with stale ETag (download1)
-        let result = backend1.upload(&download1).await;
+        let result = backend1.upload(&download1);
 
         // Should fail with conflict error (after retries exhausted)
         assert!(result.is_err(), "Expected upload with stale ETag to fail");
@@ -334,7 +334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_s3_cache_disabled() {
+    fn test_s3_cache_disabled() {
         let _guard = match test_guard("test_s3_cache_disabled") {
             Some(g) => g,
             None => return,
@@ -372,7 +372,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_s3_retry_logic() {
+    fn test_s3_retry_logic() {
         let _guard = match test_guard("test_s3_retry_logic") {
             Some(g) => g,
             None => return,
@@ -407,7 +407,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_s3_metadata_preservation() {
+    fn test_s3_metadata_preservation() {
         let _guard = match test_guard("test_s3_metadata_preservation") {
             Some(g) => g,
             None => return,

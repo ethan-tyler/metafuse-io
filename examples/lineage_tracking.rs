@@ -78,23 +78,25 @@ async fn main() -> Result<()> {
     println!("  Loaded {} raw transactions", raw_batch.num_rows());
 
     // Emit metadata for raw data
-    emitter.emit_dataset(
-        "raw_transactions",
-        "/data/raw/transactions.parquet",
-        "parquet",
-        Some("Raw transaction data from payment gateway"),
-        Some("prod"),
-        Some("sales"),
-        Some("data-ingestion@example.com"),
-        raw_schema,
-        Some(OperationalMeta {
-            row_count: Some(raw_batch.num_rows() as i64),
-            size_bytes: None,
-            partition_keys: vec![],
-        }),
-        vec![], // No upstream dependencies
-        vec!["raw".to_string(), "transactions".to_string()],
-    )?;
+    emitter
+        .emit_dataset(
+            "raw_transactions",
+            "/data/raw/transactions.parquet",
+            "parquet",
+            Some("Raw transaction data from payment gateway"),
+            Some("prod"),
+            Some("sales"),
+            Some("data-ingestion@example.com"),
+            raw_schema,
+            Some(OperationalMeta {
+                row_count: Some(raw_batch.num_rows() as i64),
+                size_bytes: None,
+                partition_keys: vec![],
+            }),
+            vec![], // No upstream dependencies
+            vec!["raw".to_string(), "transactions".to_string()],
+        )
+        .await?;
     println!("  Metadata emitted: raw_transactions\n");
 
     // ========== STAGE 2: Data Cleaning ==========
@@ -123,23 +125,25 @@ async fn main() -> Result<()> {
     );
 
     // Emit metadata for cleaned data with lineage to raw data
-    emitter.emit_dataset(
-        "cleaned_transactions",
-        "/data/cleaned/transactions.parquet",
-        "parquet",
-        Some("Cleaned and validated transaction data"),
-        Some("prod"),
-        Some("sales"),
-        Some("data-pipeline@example.com"),
-        cleaned_schema,
-        Some(OperationalMeta {
-            row_count: Some(cleaned_count as i64),
-            size_bytes: None,
-            partition_keys: vec![],
-        }),
-        vec!["raw_transactions".to_string()], // Upstream dependency
-        vec!["cleaned".to_string(), "validated".to_string()],
-    )?;
+    emitter
+        .emit_dataset(
+            "cleaned_transactions",
+            "/data/cleaned/transactions.parquet",
+            "parquet",
+            Some("Cleaned and validated transaction data"),
+            Some("prod"),
+            Some("sales"),
+            Some("data-pipeline@example.com"),
+            cleaned_schema,
+            Some(OperationalMeta {
+                row_count: Some(cleaned_count as i64),
+                size_bytes: None,
+                partition_keys: vec![],
+            }),
+            vec!["raw_transactions".to_string()], // Upstream dependency
+            vec!["cleaned".to_string(), "validated".to_string()],
+        )
+        .await?;
     println!("  Metadata emitted: cleaned_transactions");
     println!("  Lineage: raw_transactions -> cleaned_transactions\n");
 
@@ -176,27 +180,29 @@ async fn main() -> Result<()> {
     println!("  Aggregated {} customer summaries", summary_count);
 
     // Emit metadata for aggregated data with lineage to cleaned data
-    emitter.emit_dataset(
-        "daily_summary",
-        "/data/aggregates/daily_summary.parquet",
-        "parquet",
-        Some("Daily customer transaction summary"),
-        Some("prod"),
-        Some("sales"),
-        Some("analytics@example.com"),
-        summary_schema,
-        Some(OperationalMeta {
-            row_count: Some(summary_count as i64),
-            size_bytes: None,
-            partition_keys: vec![],
-        }),
-        vec!["cleaned_transactions".to_string()], // Upstream dependency
-        vec![
-            "aggregated".to_string(),
-            "summary".to_string(),
-            "daily".to_string(),
-        ],
-    )?;
+    emitter
+        .emit_dataset(
+            "daily_summary",
+            "/data/aggregates/daily_summary.parquet",
+            "parquet",
+            Some("Daily customer transaction summary"),
+            Some("prod"),
+            Some("sales"),
+            Some("analytics@example.com"),
+            summary_schema,
+            Some(OperationalMeta {
+                row_count: Some(summary_count as i64),
+                size_bytes: None,
+                partition_keys: vec![],
+            }),
+            vec!["cleaned_transactions".to_string()], // Upstream dependency
+            vec![
+                "aggregated".to_string(),
+                "summary".to_string(),
+                "daily".to_string(),
+            ],
+        )
+        .await?;
     println!("  Metadata emitted: daily_summary");
     println!("  Lineage: cleaned_transactions -> daily_summary\n");
 

@@ -13,10 +13,12 @@ rusqlite.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
 
+# Async runtime (required for all backends)
+tokio = { workspace = true, features = ["fs", "rt", "rt-multi-thread", "macros", "sync"] }
+futures = "0.3"
+
 # Cloud storage backends (optional)
 object_store = { version = "0.12.4", optional = true }
-tokio = { workspace = true, optional = true, features = ["fs", "rt"] }
-futures = { version = "0.3", optional = true }
 dirs = { version = "5.0", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
@@ -30,6 +32,7 @@ testcontainers = "0.15"
 [features]
 default = ["local"]
 local = []
-gcs = ["object_store", "object_store/gcp", "tokio", "futures", "dirs", "serde", "serde_json", "tracing", "bytes"]
-s3 = ["object_store", "object_store/aws", "tokio", "futures", "dirs", "serde", "serde_json", "tracing", "bytes"]
+gcs = ["object_store", "object_store/gcp", "dirs", "serde", "serde_json", "tracing", "bytes"]
+s3 = ["object_store", "object_store/aws", "dirs", "serde", "serde_json", "tracing", "bytes"]
 cloud = ["gcs", "s3"]
+legacy-sync = []  # Temporary sync adapter for backward compatibility (removal in v0.5.0)

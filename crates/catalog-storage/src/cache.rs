@@ -30,11 +30,11 @@ use std::path::PathBuf;
 #[cfg(any(feature = "gcs", feature = "s3"))]
 use std::time::{Duration, SystemTime};
 
-/// Trait for backends that support HEAD requests for cache revalidation
+/// Trait for backends that support HEAD requests for cache revalidation (async)
 ///
 /// Allows cache to check if a remote object has changed without downloading it.
 #[cfg(any(feature = "gcs", feature = "s3"))]
-pub trait HeadCheckBackend {
+pub trait HeadCheckBackend: Send + Sync {
     /// Perform a HEAD request to get the remote object version
     ///
     /// # Arguments
@@ -43,7 +43,10 @@ pub trait HeadCheckBackend {
     /// # Returns
     /// - `Ok(version)` if HEAD request succeeded
     /// - `Err(...)` if HEAD request failed (cache should gracefully fall back)
-    fn head_check(&self, uri: &str) -> Result<ObjectVersion>;
+    fn head_check(
+        &self,
+        uri: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ObjectVersion>> + Send + '_>>;
 }
 
 /// Cache for cloud-downloaded catalogs
@@ -133,110 +136,124 @@ impl CatalogCache {
     /// If `revalidate` is enabled and a backend is provided, performs a HEAD
     /// request to check if the cached version matches the remote version.
     /// On HEAD failure, falls back gracefully to cached copy with a warning.
-    pub fn get(
-        &self,
-        uri: &str,
-        backend: Option<&dyn HeadCheckBackend>,
-    ) -> Result<Option<CatalogDownload>> {
-        let cache_key = self.cache_path(uri);
-        let meta_path = self.meta_path(uri);
+    pub fn get<'a>(
+        &'a self,
+        uri: &'a str,
+        backend: Option<&'a dyn HeadCheckBackend>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<CatalogDownload>>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let cache_key = self.cache_path(uri);
+            let meta_path = self.meta_path(uri);
 
-        // Check if cache files exist
-        if !cache_key.exists() || !meta_path.exists() {
-            return Ok(None);
-        }
+            // Check if cache files exist
+            if !cache_key.exists() || !meta_path.exists() {
+                return Ok(None);
+            }
 
-        // Check TTL
-        let metadata = std::fs::metadata(&cache_key)
-            .map_err(|e| CatalogError::Other(format!("Failed to read cache metadata: {}", e)))?;
+            // Check TTL
+            let metadata = std::fs::metadata(&cache_key).map_err(|e| {
+                CatalogError::Other(format!("Failed to read cache metadata: {}", e))
+            })?;
 
-        let modified = metadata
-            .modified()
-            .map_err(|e| CatalogError::Other(format!("Failed to get modification time: {}", e)))?;
+            let modified = metadata.modified().map_err(|e| {
+                CatalogError::Other(format!("Failed to get modification time: {}", e))
+            })?;
 
-        let age = SystemTime::now()
-            .duration_since(modified)
-            .unwrap_or(Duration::MAX);
+            let age = SystemTime::now()
+                .duration_since(modified)
+                .unwrap_or(Duration::MAX);
 
-        if age > self.ttl {
-            tracing::debug!(
-                uri = uri,
-                age_secs = age.as_secs(),
-                ttl_secs = self.ttl.as_secs(),
-                "Cache expired"
-            );
-            return Ok(None);
-        }
+            if age > self.ttl {
+                tracing::debug!(
+                    uri = uri,
+                    age_secs = age.as_secs(),
+                    ttl_secs = self.ttl.as_secs(),
+                    "Cache expired"
+                );
+                return Ok(None);
+            }
 
-        // Read remote version from metadata file
-        let version_json = std::fs::read_to_string(&meta_path)
-            .map_err(|e| CatalogError::Other(format!("Failed to read cache metadata: {}", e)))?;
+            // Read remote version from metadata file
+            let version_json = std::fs::read_to_string(&meta_path).map_err(|e| {
+                CatalogError::Other(format!("Failed to read cache metadata: {}", e))
+            })?;
 
-        let remote_version: ObjectVersion = serde_json::from_str(&version_json)
-            .map_err(|e| CatalogError::Other(format!("Failed to parse cache metadata: {}", e)))?;
+            let remote_version: ObjectVersion =
+                serde_json::from_str(&version_json).map_err(|e| {
+                    CatalogError::Other(format!("Failed to parse cache metadata: {}", e))
+                })?;
 
-        // Read catalog version (requires opening SQLite connection)
-        let conn = rusqlite::Connection::open(&cache_key)?;
-        let catalog_version = metafuse_catalog_core::get_catalog_version(&conn)?;
+            // Read catalog version (requires opening SQLite connection)
+            let cache_key_clone = cache_key.clone();
+            let catalog_version = tokio::task::spawn_blocking(move || {
+                let conn = rusqlite::Connection::open(&cache_key_clone)?;
+                metafuse_catalog_core::get_catalog_version(&conn)
+            })
+            .await
+            .map_err(|e| CatalogError::Other(format!("Task join error: {}", e)))??;
 
-        // Perform revalidation if enabled
-        if self.revalidate {
-            if let Some(backend) = backend {
-                let mut attempts = 0u32;
-                let mut last_err: Option<CatalogError> = None;
-                while attempts < 3 {
-                    match backend.head_check(uri) {
-                        Ok(current_remote_version) => {
-                            // Compare cached version with current remote version
-                            if remote_version != current_remote_version {
-                                tracing::debug!(
-                                    uri = uri,
-                                    cached_version = ?remote_version,
-                                    remote_version = ?current_remote_version,
-                                    "Cache stale after revalidation"
-                                );
-                                return Ok(None);
-                            }
-                            tracing::debug!(uri = uri, "Cache revalidation succeeded");
-                            break;
-                        }
-                        Err(e) => {
-                            last_err = Some(e);
-                            attempts += 1;
-                            if attempts >= 3 {
+            // Perform revalidation if enabled
+            if self.revalidate {
+                if let Some(backend) = backend {
+                    let mut attempts = 0u32;
+                    let mut last_err: Option<CatalogError> = None;
+                    while attempts < 3 {
+                        match backend.head_check(uri).await {
+                            Ok(current_remote_version) => {
+                                // Compare cached version with current remote version
+                                if remote_version != current_remote_version {
+                                    tracing::debug!(
+                                        uri = uri,
+                                        cached_version = ?remote_version,
+                                        remote_version = ?current_remote_version,
+                                        "Cache stale after revalidation"
+                                    );
+                                    return Ok(None);
+                                }
+                                tracing::debug!(uri = uri, "Cache revalidation succeeded");
                                 break;
                             }
-                            // small backoff before retry
-                            std::thread::sleep(Duration::from_millis(
-                                50 * 2u64.saturating_pow(attempts - 1),
-                            ));
+                            Err(e) => {
+                                last_err = Some(e);
+                                attempts += 1;
+                                if attempts >= 3 {
+                                    break;
+                                }
+                                // small backoff before retry
+                                tokio::time::sleep(Duration::from_millis(
+                                    50 * 2u64.saturating_pow(attempts - 1),
+                                ))
+                                .await;
+                            }
                         }
                     }
-                }
 
-                if let Some(e) = last_err {
-                    // Graceful fallback: log warning and use cached copy
+                    if let Some(e) = last_err {
+                        // Graceful fallback: log warning and use cached copy
+                        tracing::warn!(
+                            uri = uri,
+                            error = %e,
+                            "Cache revalidation failed after retries, falling back to cached copy"
+                        );
+                    }
+                } else {
                     tracing::warn!(
                         uri = uri,
-                        error = %e,
-                        "Cache revalidation failed after retries, falling back to cached copy"
+                        "Cache revalidation enabled but no backend provided"
                     );
                 }
-            } else {
-                tracing::warn!(
-                    uri = uri,
-                    "Cache revalidation enabled but no backend provided"
-                );
             }
-        }
 
-        tracing::debug!(uri = uri, age_secs = age.as_secs(), "Cache hit");
+            tracing::debug!(uri = uri, age_secs = age.as_secs(), "Cache hit");
 
-        Ok(Some(CatalogDownload {
-            path: cache_key,
-            catalog_version,
-            remote_version: Some(remote_version),
-        }))
+            Ok(Some(CatalogDownload {
+                path: cache_key,
+                catalog_version,
+                remote_version: Some(remote_version),
+            }))
+        })
     }
 
     /// Store catalog in cache
@@ -338,13 +355,13 @@ mod tests {
         assert!(cache.is_some());
     }
 
-    #[test]
-    fn test_cache_miss_nonexistent_uri() {
+    #[tokio::test]
+    async fn test_cache_miss_nonexistent_uri() {
         let _guard = ENV_LOCK.lock().unwrap();
 
         std::env::set_var("METAFUSE_CACHE_TTL_SECS", "60");
         let cache = CatalogCache::from_env().unwrap().unwrap();
-        let result = cache.get("gs://nonexistent/catalog.db", None);
+        let result = cache.get("gs://nonexistent/catalog.db", None).await;
         std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
         assert!(result.unwrap().is_none());
     }

@@ -110,9 +110,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     // Check if catalog exists for local backends
-    if let Ok(false) = backend.exists() {
+    if let Ok(false) = backend.exists().await {
         tracing::warn!("Catalog does not exist, initializing new catalog");
-        backend.initialize().map_err(|e| {
+        backend.initialize().await.map_err(|e| {
             tracing::error!("Failed to initialize catalog: {}", e);
             e
         })?;
@@ -194,6 +194,7 @@ async fn list_datasets(
     let conn = state
         .backend
         .get_connection()
+        .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     let mut query = String::from(
@@ -272,6 +273,7 @@ async fn get_dataset(
     let conn = state
         .backend
         .get_connection()
+        .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     // Get dataset
@@ -405,6 +407,7 @@ async fn search_datasets(
     let conn = state
         .backend
         .get_connection()
+        .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     let mut stmt = conn

@@ -10,8 +10,7 @@ use metafuse_catalog_core::{
 };
 use metafuse_catalog_storage::CatalogBackend;
 use rusqlite::Connection;
-use std::thread;
-use std::time::Duration;
+use tokio::time::Duration;
 
 /// Emitter API for capturing metadata from DataFusion pipelines
 ///
@@ -74,7 +73,7 @@ impl<B: CatalogBackend> Emitter<B> {
     /// * `upstream_datasets` - List of upstream dataset names this depends on
     /// * `tags` - Tags for categorization and discovery
     #[allow(clippy::too_many_arguments)]
-    pub fn emit_dataset(
+    pub async fn emit_dataset(
         &self,
         name: &str,
         path: &str,
@@ -160,7 +159,7 @@ impl<B: CatalogBackend> Emitter<B> {
             operational,
         };
 
-        self.write_dataset(&dataset)?;
+        self.write_dataset(&dataset).await?;
 
         Ok(())
     }
@@ -173,13 +172,13 @@ impl<B: CatalogBackend> Emitter<B> {
     /// 3. Validate catalog version was incremented
     /// 4. Upload modified catalog with version preconditions
     /// 5. If upload fails due to conflict, retry with exponential backoff
-    fn write_dataset(&self, dataset: &DatasetMeta) -> Result<()> {
+    async fn write_dataset(&self, dataset: &DatasetMeta) -> Result<()> {
         const MAX_RETRIES: u32 = 3;
         let mut retry_count = 0;
 
         loop {
             // Download catalog (captures current version and remote metadata)
-            let download = self.backend.download()?;
+            let download = self.backend.download().await?;
             let expected_version = download.catalog_version;
 
             tracing::debug!(
@@ -188,24 +187,35 @@ impl<B: CatalogBackend> Emitter<B> {
                 "Downloaded catalog for write"
             );
 
-            // Open connection to the downloaded catalog
-            let mut conn = Connection::open(&download.path)?;
-            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-            init_sqlite_schema(&conn)?;
+            // Clone data for move into spawn_blocking
+            let dataset_clone = dataset.clone();
+            let download_path = download.path.clone();
 
-            // Perform all writes in a transaction
-            let tx = conn.transaction()?;
-            self.write_dataset_tx(&tx, dataset)?;
-            tx.commit()?;
+            // Perform all SQLite operations in spawn_blocking to avoid blocking async executor
+            let new_version = tokio::task::spawn_blocking(move || -> Result<i64> {
+                // Open connection to the downloaded catalog
+                let mut conn = Connection::open(&download_path)?;
+                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+                init_sqlite_schema(&conn)?;
 
-            // Verify version was incremented (sanity check)
-            let new_version = get_catalog_version(&conn)?;
-            if new_version <= expected_version {
-                return Err(CatalogError::Other(format!(
-                    "Catalog version not incremented: expected > {}, got {}",
-                    expected_version, new_version
-                )));
-            }
+                // Perform all writes in a transaction
+                let tx = conn.transaction()?;
+                write_dataset_tx(&tx, &dataset_clone)?;
+                tx.commit()?;
+
+                // Verify version was incremented (sanity check)
+                let new_version = get_catalog_version(&conn)?;
+                if new_version <= expected_version {
+                    return Err(CatalogError::Other(format!(
+                        "Catalog version not incremented: expected > {}, got {}",
+                        expected_version, new_version
+                    )));
+                }
+
+                Ok(new_version)
+            })
+            .await
+            .map_err(|e| CatalogError::Other(format!("Task join error: {}", e)))??;
 
             tracing::debug!(
                 dataset = %dataset.name,
@@ -215,7 +225,7 @@ impl<B: CatalogBackend> Emitter<B> {
             );
 
             // Upload the modified catalog with optimistic locking
-            match self.backend.upload(&download) {
+            match self.backend.upload(&download).await {
                 Ok(()) => {
                     tracing::info!(
                         dataset = %dataset.name,
@@ -236,7 +246,7 @@ impl<B: CatalogBackend> Emitter<B> {
                         error = %msg,
                         "Catalog conflict detected, retrying..."
                     );
-                    thread::sleep(Duration::from_millis(backoff_ms));
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                     // Loop will retry with fresh download
                 }
                 Err(CatalogError::ConflictError(msg)) => {
@@ -250,132 +260,131 @@ impl<B: CatalogBackend> Emitter<B> {
         }
     }
 
-    /// Perform dataset writes within a transaction
-    fn write_dataset_tx(&self, tx: &rusqlite::Transaction, dataset: &DatasetMeta) -> Result<()> {
-        // Extract operational metadata
-        let (row_count, size_bytes, partition_keys_json) = if let Some(ref op) = dataset.operational
-        {
-            let partition_keys_json = if op.partition_keys.is_empty() {
-                None
-            } else {
-                // Store as JSON array for proper structure and no delimiter issues
-                Some(
-                    serde_json::to_string(&op.partition_keys)
-                        .map_err(|e| CatalogError::SerializationError(e.to_string()))?,
-                )
-            };
-            (op.row_count, op.size_bytes, partition_keys_json)
-        } else {
-            (None, None, None)
-        };
-
-        // Insert or update dataset
-        tx.execute(
-            r#"
-            INSERT INTO datasets (name, path, format, description, tenant, domain, owner, created_at, last_updated, row_count, size_bytes, partition_keys)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-            ON CONFLICT(name) DO UPDATE SET
-                path = excluded.path,
-                format = excluded.format,
-                description = excluded.description,
-                tenant = excluded.tenant,
-                domain = excluded.domain,
-                owner = excluded.owner,
-                last_updated = excluded.last_updated,
-                row_count = excluded.row_count,
-                size_bytes = excluded.size_bytes,
-                partition_keys = excluded.partition_keys
-            "#,
-            rusqlite::params![
-                dataset.name,
-                dataset.path,
-                dataset.format,
-                dataset.description,
-                dataset.tenant,
-                dataset.domain,
-                dataset.owner,
-                dataset.created_at.to_rfc3339(),
-                dataset.last_updated.to_rfc3339(),
-                row_count,
-                size_bytes,
-                partition_keys_json,
-            ],
-        )?;
-
-        // Get dataset ID
-        let dataset_id: i64 = tx.query_row(
-            "SELECT id FROM datasets WHERE name = ?1",
-            [&dataset.name],
-            |row| row.get(0),
-        )?;
-
-        // Delete existing fields and insert new ones
-        tx.execute("DELETE FROM fields WHERE dataset_id = ?1", [dataset_id])?;
-
-        for field in &dataset.fields {
-            tx.execute(
-                "INSERT INTO fields (dataset_id, name, data_type, nullable, description) VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
-                    dataset_id,
-                    field.name,
-                    field.data_type,
-                    field.nullable as i32,
-                    field.description,
-                ],
-            )?;
-        }
-
-        // Delete existing lineage and insert new ones
-        tx.execute(
-            "DELETE FROM lineage WHERE downstream_dataset_id = ?1",
-            [dataset_id],
-        )?;
-
-        for upstream_name in &dataset.upstream_datasets {
-            // Get or skip if upstream doesn't exist
-            let upstream_id: Option<i64> = tx
-                .query_row(
-                    "SELECT id FROM datasets WHERE name = ?1",
-                    [upstream_name],
-                    |row| row.get(0),
-                )
-                .ok();
-
-            if let Some(upstream_id) = upstream_id {
-                tx.execute(
-                    "INSERT OR IGNORE INTO lineage (upstream_dataset_id, downstream_dataset_id, created_at) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![
-                        upstream_id,
-                        dataset_id,
-                        Utc::now().to_rfc3339(),
-                    ],
-                )?;
-            }
-        }
-
-        // Delete existing tags and insert new ones
-        tx.execute("DELETE FROM tags WHERE dataset_id = ?1", [dataset_id])?;
-
-        for tag in &dataset.tags {
-            tx.execute(
-                "INSERT OR IGNORE INTO tags (dataset_id, tag) VALUES (?1, ?2)",
-                rusqlite::params![dataset_id, tag],
-            )?;
-        }
-
-        // NOTE: FTS index is automatically maintained by triggers on datasets/fields/tags tables.
-        // No manual dataset_search insert/delete needed here.
-
-        // Increment catalog version for optimistic concurrency control
-        increment_catalog_version(tx)?;
-
-        Ok(())
-    }
-
     /// Get a reference to the backend
     pub fn backend(&self) -> &B {
         &self.backend
     }
+}
+
+/// Perform dataset writes within a transaction
+fn write_dataset_tx(tx: &rusqlite::Transaction, dataset: &DatasetMeta) -> Result<()> {
+    // Extract operational metadata
+    let (row_count, size_bytes, partition_keys_json) = if let Some(ref op) = dataset.operational {
+        let partition_keys_json = if op.partition_keys.is_empty() {
+            None
+        } else {
+            // Store as JSON array for proper structure and no delimiter issues
+            Some(
+                serde_json::to_string(&op.partition_keys)
+                    .map_err(|e| CatalogError::SerializationError(e.to_string()))?,
+            )
+        };
+        (op.row_count, op.size_bytes, partition_keys_json)
+    } else {
+        (None, None, None)
+    };
+
+    // Insert or update dataset
+    tx.execute(
+        r#"
+        INSERT INTO datasets (name, path, format, description, tenant, domain, owner, created_at, last_updated, row_count, size_bytes, partition_keys)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        ON CONFLICT(name) DO UPDATE SET
+            path = excluded.path,
+            format = excluded.format,
+            description = excluded.description,
+            tenant = excluded.tenant,
+            domain = excluded.domain,
+            owner = excluded.owner,
+            last_updated = excluded.last_updated,
+            row_count = excluded.row_count,
+            size_bytes = excluded.size_bytes,
+            partition_keys = excluded.partition_keys
+        "#,
+        rusqlite::params![
+            dataset.name,
+            dataset.path,
+            dataset.format,
+            dataset.description,
+            dataset.tenant,
+            dataset.domain,
+            dataset.owner,
+            dataset.created_at.to_rfc3339(),
+            dataset.last_updated.to_rfc3339(),
+            row_count,
+            size_bytes,
+            partition_keys_json,
+        ],
+    )?;
+
+    // Get dataset ID
+    let dataset_id: i64 = tx.query_row(
+        "SELECT id FROM datasets WHERE name = ?1",
+        [&dataset.name],
+        |row| row.get(0),
+    )?;
+
+    // Delete existing fields and insert new ones
+    tx.execute("DELETE FROM fields WHERE dataset_id = ?1", [dataset_id])?;
+
+    for field in &dataset.fields {
+        tx.execute(
+            "INSERT INTO fields (dataset_id, name, data_type, nullable, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                dataset_id,
+                field.name,
+                field.data_type,
+                field.nullable as i32,
+                field.description,
+            ],
+        )?;
+    }
+
+    // Delete existing lineage and insert new ones
+    tx.execute(
+        "DELETE FROM lineage WHERE downstream_dataset_id = ?1",
+        [dataset_id],
+    )?;
+
+    for upstream_name in &dataset.upstream_datasets {
+        // Get or skip if upstream doesn't exist
+        let upstream_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM datasets WHERE name = ?1",
+                [upstream_name],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if let Some(upstream_id) = upstream_id {
+            tx.execute(
+                "INSERT OR IGNORE INTO lineage (upstream_dataset_id, downstream_dataset_id, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    upstream_id,
+                    dataset_id,
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+        }
+    }
+
+    // Delete existing tags and insert new ones
+    tx.execute("DELETE FROM tags WHERE dataset_id = ?1", [dataset_id])?;
+
+    for tag in &dataset.tags {
+        tx.execute(
+            "INSERT OR IGNORE INTO tags (dataset_id, tag) VALUES (?1, ?2)",
+            rusqlite::params![dataset_id, tag],
+        )?;
+    }
+
+    // NOTE: FTS index is automatically maintained by triggers on datasets/fields/tags tables.
+    // No manual dataset_search insert/delete needed here.
+
+    // Increment catalog version for optimistic concurrency control
+    increment_catalog_version(tx)?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -386,8 +395,8 @@ mod tests {
     use std::sync::Arc;
     use tempfile::NamedTempFile;
 
-    #[test]
-    fn test_emit_dataset() {
+    #[tokio::test]
+    async fn test_emit_dataset() {
         let temp_file = NamedTempFile::new().unwrap();
         let backend = LocalSqliteBackend::new(temp_file.path());
         let emitter = Emitter::new(backend);
@@ -416,10 +425,11 @@ mod tests {
                 vec![],
                 vec!["test".to_string(), "sample".to_string()],
             )
+            .await
             .unwrap();
 
         // Verify dataset was written
-        let conn = emitter.backend().get_connection().unwrap();
+        let conn = emitter.backend().get_connection().await.unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM datasets", [], |row| row.get(0))
             .unwrap();
@@ -448,8 +458,8 @@ mod tests {
         assert_eq!(partition_keys, Some(r#"["date"]"#.to_string()));
     }
 
-    #[test]
-    fn test_emit_dataset_with_lineage() {
+    #[tokio::test]
+    async fn test_emit_dataset_with_lineage() {
         let temp_file = NamedTempFile::new().unwrap();
         let backend = LocalSqliteBackend::new(temp_file.path());
         let emitter = Emitter::new(backend);
@@ -471,6 +481,7 @@ mod tests {
                 vec![],
                 vec![],
             )
+            .await
             .unwrap();
 
         // Create downstream dataset with lineage
@@ -488,10 +499,11 @@ mod tests {
                 vec!["upstream".to_string()],
                 vec![],
             )
+            .await
             .unwrap();
 
         // Verify lineage was created
-        let conn = emitter.backend().get_connection().unwrap();
+        let conn = emitter.backend().get_connection().await.unwrap();
         let lineage_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM lineage", [], |row| row.get(0))
             .unwrap();
