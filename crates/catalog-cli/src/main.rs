@@ -62,19 +62,20 @@ enum Commands {
     Stats,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Init { force } => init_catalog(&cli.catalog, force),
+        Commands::Init { force } => init_catalog(&cli.catalog, force).await,
         Commands::List {
             tenant,
             domain,
             verbose,
-        } => list_datasets(&cli.catalog, tenant, domain, verbose),
-        Commands::Show { name, lineage } => show_dataset(&cli.catalog, &name, lineage),
-        Commands::Search { query } => search_datasets(&cli.catalog, &query),
-        Commands::Stats => show_stats(&cli.catalog),
+        } => list_datasets(&cli.catalog, tenant, domain, verbose).await,
+        Commands::Show { name, lineage } => show_dataset(&cli.catalog, &name, lineage).await,
+        Commands::Search { query } => search_datasets(&cli.catalog, &query).await,
+        Commands::Stats => show_stats(&cli.catalog).await,
     };
 
     if let Err(e) = result {
@@ -83,10 +84,10 @@ fn main() {
     }
 }
 
-fn init_catalog(path: &str, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn init_catalog(path: &str, force: bool) -> Result<(), Box<dyn std::error::Error>> {
     let backend = backend_from_uri(path)?;
 
-    if backend.exists()? {
+    if backend.exists().await? {
         if !force {
             return Err(format!(
                 "Catalog already exists at '{}'. Use --force to overwrite.",
@@ -98,20 +99,20 @@ fn init_catalog(path: &str, force: bool) -> Result<(), Box<dyn std::error::Error
         std::fs::remove_file(path)?;
     }
 
-    backend.initialize()?;
+    backend.initialize().await?;
     println!("Initialized catalog at '{}'", path);
 
     Ok(())
 }
 
-fn list_datasets(
+async fn list_datasets(
     path: &str,
     tenant: Option<String>,
     domain: Option<String>,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let backend = backend_from_uri(path)?;
-    let conn = backend.get_connection()?;
+    let conn = backend.get_connection().await?;
 
     let mut query = String::from(
         "SELECT name, path, format, description, tenant, domain, owner, last_updated, row_count, size_bytes FROM datasets WHERE 1=1",
@@ -213,13 +214,13 @@ fn list_datasets(
     Ok(())
 }
 
-fn show_dataset(
+async fn show_dataset(
     path: &str,
     name: &str,
     show_lineage: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let backend = backend_from_uri(path)?;
-    let conn = backend.get_connection()?;
+    let conn = backend.get_connection().await?;
 
     // Get dataset info
     let dataset: Result<_, rusqlite::Error> = conn.query_row(
@@ -361,12 +362,12 @@ fn show_dataset(
     Ok(())
 }
 
-fn search_datasets(path: &str, query: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn search_datasets(path: &str, query: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Validate FTS query (operators are allowed for powerful search)
     let validated_query = validation::validate_fts_query(query)?;
 
     let backend = backend_from_uri(path)?;
-    let conn = backend.get_connection()?;
+    let conn = backend.get_connection().await?;
 
     let mut stmt = conn.prepare(
         r#"
@@ -402,9 +403,9 @@ fn search_datasets(path: &str, query: &str) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-fn show_stats(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn show_stats(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let backend = backend_from_uri(path)?;
-    let conn = backend.get_connection()?;
+    let conn = backend.get_connection().await?;
 
     let dataset_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM datasets", [], |row| row.get(0))?;

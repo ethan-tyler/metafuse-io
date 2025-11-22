@@ -35,3 +35,4 @@ local = []
 gcs = ["object_store", "object_store/gcp", "dirs", "serde", "serde_json", "tracing", "bytes"]
 s3 = ["object_store", "object_store/aws", "dirs", "serde", "serde_json", "tracing", "bytes"]
 cloud = ["gcs", "s3"]
+legacy-sync = []  # Temporary sync adapter for backward compatibility (removal in v0.5.0)
