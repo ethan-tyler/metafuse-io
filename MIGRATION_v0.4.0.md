@@ -31,15 +31,20 @@ pub trait CatalogBackend {
 
 **After (v0.4.0):**
 ```rust
-#[async_trait::async_trait]
+use std::future::Future;
+use std::pin::Pin;
+
 pub trait CatalogBackend: Send + Sync {
-    async fn initialize(&self) -> Result<()>;
-    async fn download(&self) -> Result<Download>;
-    async fn upload(&self, download: &Download) -> Result<()>;
-    async fn get_connection(&self) -> Result<Connection>;
-    async fn exists(&self) -> Result<bool>;
+    fn download(&self) -> Pin<Box<dyn Future<Output = Result<Download>> + Send + '_>>;
+    fn upload(&self, download: &Download)
+        -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+    fn get_connection(&self)
+        -> Pin<Box<dyn Future<Output = Result<Connection>> + Send + '_>>;
+    fn exists(&self) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + '_>>;
 }
 ```
+
+**Note:** v0.4.0 uses manual `Pin<Box<dyn Future>>` for async traits (zero-cost, no dependencies).
 
 **Key Change:** Add `.await` to all backend method calls.
 
