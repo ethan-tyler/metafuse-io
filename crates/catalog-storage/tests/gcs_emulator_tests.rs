@@ -10,13 +10,13 @@
 
 #[cfg(all(test, feature = "gcs"))]
 mod tests {
-    use metafuse_catalog_core::{CatalogError, DatasetMeta, FieldMeta};
+    use metafuse_catalog_core::CatalogError;
     use metafuse_catalog_storage::{CatalogBackend, GcsBackend};
     use std::net::TcpStream;
     use std::process::Command;
     use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
-    use testcontainers::{clients::Cli, images::generic::GenericImage, RunnableImage};
+    use testcontainers::{clients::Cli, core::WaitFor, GenericImage};
 
     // Serialize tests to avoid env var collisions and emulator port reuse.
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -65,17 +65,15 @@ mod tests {
     }
 
     /// Create a test GCS backend with emulator
-    fn setup_gcs_backend(
-        docker: &Cli,
+    fn setup_gcs_backend<'a>(
+        docker: &'a Cli,
         bucket_name: &str,
         object_name: &str,
-    ) -> (impl Drop, GcsBackend) {
+    ) -> (impl Drop + 'a, GcsBackend) {
         // Start fake-gcs-server container
         let gcs_image = GenericImage::new("fsouza/fake-gcs-server", "latest")
             .with_exposed_port(4443)
-            .with_wait_for(testcontainers::core::WaitFor::message_on_stdout(
-                "server started at",
-            ));
+            .with_wait_for(WaitFor::message_on_stdout("server started at"));
 
         let gcs_container = docker.run(gcs_image);
         let gcs_port = gcs_container.get_host_port_ipv4(4443);

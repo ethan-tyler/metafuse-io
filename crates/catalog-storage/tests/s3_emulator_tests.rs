@@ -10,13 +10,13 @@
 
 #[cfg(all(test, feature = "s3"))]
 mod tests {
-    use metafuse_catalog_core::{CatalogError, DatasetMeta, FieldMeta};
+    use metafuse_catalog_core::CatalogError;
     use metafuse_catalog_storage::{CatalogBackend, S3Backend};
     use std::net::TcpStream;
     use std::process::Command;
     use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
-    use testcontainers::{clients::Cli, images::generic::GenericImage, RunnableImage};
+    use testcontainers::{clients::Cli, core::WaitFor, GenericImage};
 
     // Serialize tests to avoid env var collisions and emulator port reuse.
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -65,22 +65,19 @@ mod tests {
     }
 
     /// Create a test S3 backend with MinIO emulator
-    fn setup_s3_backend(
-        docker: &Cli,
+    fn setup_s3_backend<'a>(
+        docker: &'a Cli,
         bucket_name: &str,
         object_key: &str,
-    ) -> (impl Drop, S3Backend) {
+    ) -> (impl Drop + 'a, S3Backend) {
         // Start MinIO container
         let minio_image = GenericImage::new("minio/minio", "latest")
             .with_exposed_port(9000)
             .with_env_var("MINIO_ROOT_USER", "minioadmin")
             .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
-            .with_wait_for(testcontainers::core::WaitFor::message_on_stdout("API:"));
+            .with_wait_for(WaitFor::message_on_stdout("API:"));
 
-        let minio_container = docker.run(
-            RunnableImage::from(minio_image)
-                .with_args(vec!["server".to_string(), "/data".to_string()]),
-        );
+        let minio_container = docker.run(minio_image);
         let minio_port = minio_container.get_host_port_ipv4(9000);
 
         // Wait for readiness
