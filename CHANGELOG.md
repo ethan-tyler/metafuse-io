@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Planned for v0.4.0 (breaking)
+- Async backend refactor (CatalogBackend methods async; CLI/Emitter migration)
+- Optional removal of sync adapters (legacy path)
+
+## [0.3.1] - 2025-01-21
+
+**Quality & Testing Release** - Non-breaking enhancements to cloud backend testing and cache behavior.
+
+### Added
+
+- **Emulator-Based Integration Tests**
+  - Comprehensive GCS backend tests using `fake-gcs-server` Docker emulator (9 tests)
+  - Comprehensive S3 backend tests using MinIO Docker emulator (10 tests)
+  - `testcontainers-rs` integration for automatic container lifecycle management
+  - Emulator readiness retry helper with 30-second timeout
+  - Tests cover: initialization, existence checks, upload/download, concurrent writes, retry logic, cache behavior, metadata preservation
+- **Optional Cache Revalidation** (`METAFUSE_CACHE_REVALIDATE`)
+  - HEAD request validation before returning cached entries
+  - Ensures cached version matches remote version
+  - Adds ~50-200ms latency per cache hit when enabled
+  - Default: `false` (backwards compatible, no performance impact)
+  - Set `METAFUSE_CACHE_REVALIDATE=true` to enable
+- **HeadCheckBackend Trait**
+  - Abstraction for backends to perform lightweight version checks
+  - Implemented for `GcsBackend` (using generation numbers)
+  - Implemented for `S3Backend` (using ETags)
+  - Graceful fallback: logs warning and uses cached copy on HEAD failures
+
+### Changed
+
+- **Cache Revalidation Logic**
+  - `CatalogCache::get()` now accepts optional backend reference
+  - Revalidation compares cached version with remote HEAD response
+  - Returns `None` (cache miss) if versions differ
+  - Falls back to cached copy if HEAD request fails (prevents cascading failures)
+- **ObjectVersion Comparison**
+  - Added `PartialEq` and `Eq` derives to `ObjectVersion`
+  - Enables version comparison for cache revalidation
+
+### Testing
+
+- **Emulator Test Coverage** (19 new tests)
+  - GCS tests: initialize, exists, roundtrip, not found, connection, concurrent writes, cache disabled, retry, metadata, region config
+  - S3 tests: same as GCS plus region configuration test
+  - All tests use emulators (no cloud credentials required)
+  - Tests are gated by feature flags (`gcs`, `s3`)
+- **Cache Revalidation Tests** (3 new tests)
+  - Default disabled behavior (backwards compatibility)
+  - Explicit enable/disable via environment variable
+  - All 8 cache tests passing
+
+### Configuration
+
+- **New Environment Variables**
+  - `METAFUSE_CACHE_REVALIDATE`: Enable HEAD revalidation on cache hits (default: `false`)
+  - Existing variables unchanged (`METAFUSE_CACHE_TTL_SECS` still controls TTL)
+
+### Migration Notes
+
+- **Breaking Changes**: None - all changes are fully backward compatible
+- **Existing Deployments**: No action required
+  - Cache behavior unchanged by default (no revalidation)
+  - Performance characteristics remain the same
+- **Enable Revalidation**: Set `METAFUSE_CACHE_REVALIDATE=true` for stronger consistency
+  - Trade-off: Adds ~50-200ms per cache hit for HEAD request
+  - Benefit: Detects stale cache immediately instead of waiting for TTL expiration
+
+### Known Limitations
+
+- **Emulator Tests Not in CI**: Emulator tests require Docker and are not yet integrated into CI
+  - Run locally: `cargo test --features gcs --test gcs_emulator_tests`
+  - Run locally: `cargo test --features s3 --test s3_emulator_tests`
+  - Future release will add optional CI job (non-blocking)
+- **Revalidation Overhead**: Enabling revalidation adds latency to every cache hit
+  - Recommended for scenarios where cache freshness is critical
+  - Keep disabled for read-heavy workloads prioritizing performance
+
+### Dependencies
+
+- Added `testcontainers` 0.15.0 (dev-dependency for emulator tests)
+
+---
+
 ## [0.3.0] - 2025-01-21
 
 **Cloud-Ready Release** - Multi-cloud backend support with optimistic concurrency and caching.

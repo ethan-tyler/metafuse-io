@@ -192,6 +192,76 @@ cargo run --example lineage_tracking
 
 See [examples/README.md](examples/README.md) for detailed walkthrough and expected output.
 
+### Emulator Tests (Optional)
+
+Cloud emulator tests are available for GCS (fake-gcs-server) and S3 (MinIO). They require Docker and are gated behind an env flag:
+
+```bash
+RUN_CLOUD_TESTS=1 cargo test --features cloud --test gcs_emulator_tests --test s3_emulator_tests
+```
+
+If Docker is unavailable or `RUN_CLOUD_TESTS` is not set, the emulator tests will be skipped.
+
+## Testing
+
+### Running Tests
+
+```bash
+# Run all local tests (no cloud dependencies)
+cargo test
+
+# Run cache tests with GCS/S3 features
+cargo test -p metafuse-catalog-storage --features gcs,s3
+```
+
+### Emulator-Based Integration Tests
+
+MetaFuse includes comprehensive integration tests for GCS and S3 backends using Docker emulators. These tests validate cloud backend behavior without requiring actual cloud credentials.
+
+**Requirements:**
+
+- Docker installed and running
+- `testcontainers-rs` dependency (included in dev-dependencies)
+
+**Running GCS Emulator Tests:**
+
+```bash
+# Requires Docker
+cargo test --features gcs --test gcs_emulator_tests
+```
+
+Uses `fake-gcs-server` Docker image. Tests cover:
+
+- Catalog initialization and existence checks
+- Upload/download roundtrips with generation-based versioning
+- Concurrent write detection and conflict handling
+- Retry logic with exponential backoff
+- Cache behavior (enabled/disabled)
+- Metadata preservation across uploads
+
+**Running S3 Emulator Tests:**
+
+```bash
+# Requires Docker
+cargo test --features s3 --test s3_emulator_tests
+```
+
+Uses MinIO Docker image. Tests cover:
+
+- Catalog initialization and existence checks
+- Upload/download roundtrips with ETag-based versioning
+- Concurrent write detection and conflict handling
+- Retry logic with exponential backoff
+- Cache behavior (enabled/disabled)
+- Metadata preservation and region configuration
+
+**Note:** Emulator tests automatically:
+
+- Start Docker containers via `testcontainers-rs`
+- Wait for container readiness (30-second timeout)
+- Clean up containers after test completion
+- Run in isolated environments (no credential leakage)
+
 ## Documentation
 
 - **[Getting Started](docs/getting-started.md)** - 10-minute tutorial
