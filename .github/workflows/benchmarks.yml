@@ -1,0 +1,64 @@
+name: Benchmarks
+
+on:
+  schedule:
+    # Run every Monday at 3 AM UTC
+    - cron: '0 3 * * 1'
+  workflow_dispatch:  # Allow manual triggering
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Run Benchmarks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: benchmarks-scheduled
+
+      - name: Run benchmarks
+        run: |
+          cargo bench --verbose -- --output-format bencher | tee benchmark-results.txt
+
+      - name: Store benchmark results
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: 'cargo'
+          output-file-path: benchmark-results.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: false
+          comment-on-alert: true
+          fail-on-alert: false
+          alert-threshold: '120%'  # Alert if 20% performance regression (manual review)
+
+      - name: Archive benchmark results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results
+          path: |
+            benchmark-results.txt
+            target/criterion/
+          retention-days: 90
+
+      - name: Comment benchmark summary
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Full results available in artifacts." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          tail -n 50 benchmark-results.txt >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

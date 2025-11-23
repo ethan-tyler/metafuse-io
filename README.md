@@ -3,6 +3,7 @@
 > **Lightweight, serverless data catalog for DataFusion and modern lakehouse pipelines**
 
 [![CI](https://github.com/ethan-tyler/MetaFuse/workflows/CI/badge.svg)](https://github.com/ethan-tyler/MetaFuse/actions)
+[![codecov](https://codecov.io/gh/ethan-tyler/MetaFuse/branch/main/graph/badge.svg)](https://codecov.io/gh/ethan-tyler/MetaFuse)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
@@ -192,15 +193,21 @@ cargo run --example lineage_tracking
 
 See [examples/README.md](examples/README.md) for detailed walkthrough and expected output.
 
-### Emulator Tests (Optional)
+### Cloud Emulator Tests (Optional)
 
-Cloud emulator tests are available for GCS (fake-gcs-server) and S3 (MinIO). They require Docker and are gated behind an env flag:
+MetaFuse includes comprehensive integration tests for GCS and S3 backends using Docker-based emulators. These tests validate cloud-specific behavior without requiring cloud credentials.
 
 ```bash
-RUN_CLOUD_TESTS=1 cargo test --features cloud --test gcs_emulator_tests --test s3_emulator_tests
+# Run GCS emulator tests (requires Docker)
+RUN_CLOUD_TESTS=1 cargo test --features gcs --test gcs_emulator_tests
+
+# Run S3 emulator tests (requires Docker)
+RUN_CLOUD_TESTS=1 cargo test --features s3 --test s3_emulator_tests
 ```
 
-If Docker is unavailable or `RUN_CLOUD_TESTS` is not set, the emulator tests will be skipped.
+**What's tested:** Versioning (generations/ETags), concurrent writes, retry logic, cache behavior, metadata preservation.
+
+For comprehensive documentation, see [Cloud Emulator Testing Guide](docs/cloud-emulator-tests.md).
 
 ## Testing
 

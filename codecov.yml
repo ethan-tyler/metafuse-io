@@ -1,0 +1,71 @@
+codecov:
+  require_ci_to_pass: false  # Don't block PRs on coverage, informational only
+  notify:
+    wait_for_ci: true
+
+coverage:
+  precision: 2
+  round: down
+  range: "60...90"  # Good coverage: 60-90%
+
+  status:
+    project:
+      default:
+        target: 60%  # Minimum acceptable coverage
+        threshold: 1%  # Allow 1% drop in coverage
+        if_ci_failed: ignore
+        informational: true  # Don't block PRs
+
+    patch:
+      default:
+        target: 70%  # New code should have higher coverage
+        threshold: 5%  # Allow some flexibility for new features
+        if_ci_failed: ignore
+        informational: true
+
+flags:
+  default:
+    paths:
+      - crates/
+    carryforward: true
+
+  metrics:
+    paths:
+      - crates/catalog-api/src/metrics.rs
+    carryforward: true
+
+comment:
+  layout: "header, diff, flags, components"
+  behavior: default
+  require_changes: false
+  require_base: false
+  require_head: true
+
+ignore:
+  - "tests/**/*"
+  - "benches/**/*"
+  - "examples/**/*"
+  - "**/tests.rs"
+  - "**/benches.rs"
+
+component_management:
+  individual_components:
+    - component_id: core
+      name: Core Library
+      paths:
+        - crates/metafuse-core/**/*.rs
+
+    - component_id: catalog-api
+      name: Catalog API
+      paths:
+        - crates/catalog-api/**/*.rs
+
+    - component_id: catalog-cli
+      name: Catalog CLI
+      paths:
+        - crates/catalog-cli/**/*.rs
+
+    - component_id: query-engine
+      name: Query Engine
+      paths:
+        - crates/query-engine/**/*.rs

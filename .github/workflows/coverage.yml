@@ -1,0 +1,83 @@
+name: Code Coverage
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: Code Coverage (Linux)
+    runs-on: ubuntu-latest
+    continue-on-error: true  # Informational only, doesn't block PRs
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage-linux
+
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin
+
+      - name: Generate coverage (default features)
+        run: |
+          cargo tarpaulin \
+            --workspace \
+            --timeout 300 \
+            --out xml \
+            --output-dir coverage \
+            --exclude-files 'tests/*' 'benches/*' 'examples/*' \
+            --verbose
+
+      - name: Generate coverage (metrics feature)
+        run: |
+          cargo tarpaulin \
+            -p metafuse-catalog-api \
+            --features metrics \
+            --timeout 300 \
+            --out xml \
+            --output-dir coverage-metrics \
+            --exclude-files 'tests/*' 'benches/*' 'examples/*' \
+            --verbose
+
+      - name: Upload coverage to Codecov (default)
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage/cobertura.xml
+          flags: default
+          name: default-features
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+      - name: Upload coverage to Codecov (metrics)
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage-metrics/cobertura.xml
+          flags: metrics
+          name: metrics-feature
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+      - name: Archive coverage artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-reports
+          path: |
+            coverage/
+            coverage-metrics/
+          retention-days: 30

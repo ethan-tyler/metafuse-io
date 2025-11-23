@@ -160,6 +160,50 @@ open coverage/index.html
 - API: >75%
 - CLI: >70%
 
+### Cloud Emulator Tests
+
+MetaFuse includes comprehensive integration tests for GCS and S3 backends using Docker-based emulators. These tests validate cloud-specific behavior (versioning, concurrency, retries) without requiring cloud credentials.
+
+**Requirements:**
+
+- Docker installed and running
+- `RUN_CLOUD_TESTS=1` environment variable to enable tests
+
+**Quick Start:**
+
+```bash
+# Run GCS emulator tests
+RUN_CLOUD_TESTS=1 cargo test --features gcs --test gcs_emulator_tests
+
+# Run S3 emulator tests
+RUN_CLOUD_TESTS=1 cargo test --features s3 --test s3_emulator_tests
+
+# Run with verbose output
+RUN_CLOUD_TESTS=1 cargo test --features gcs --test gcs_emulator_tests -- --nocapture
+```
+
+**What's Tested:**
+
+- Catalog initialization and existence checks
+- Upload/download roundtrips with versioning (GCS generations, S3 ETags)
+- Concurrent write detection and conflict handling
+- Retry logic with exponential backoff
+- Cache behavior (enabled/disabled)
+- Metadata preservation
+
+**Emulators Used:**
+
+- **GCS**: `fsouza/fake-gcs-server` - HTTP-compatible GCS API emulator
+- **S3**: `minio/minio` - Full S3-compatible object storage
+
+**When to Run:**
+
+- Before submitting PRs that touch cloud backend code
+- After modifying versioning/concurrency logic
+- When adding new cloud-specific features
+
+For comprehensive documentation, see [Cloud Emulator Testing Guide](cloud-emulator-tests.md).
+
 ---
 
 ## Backend URI System

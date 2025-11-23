@@ -94,3 +94,22 @@ jobs:
         run: |
           ls -lh target/release/metafuse || echo "CLI binary not found"
           ls -lh target/release/metafuse-api || echo "API binary not found"
+
+  benchmarks:
+    name: Benchmark Compile Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: benchmarks-linux
+
+      - name: Check benchmark compilation
+        run: cargo bench --no-run --verbose

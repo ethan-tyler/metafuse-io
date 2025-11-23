@@ -7,9 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.2] - 2025-01-22
+## [0.4.2] - 2025-01-23
 
-**Observability & Monitoring Release** - Patch release adding optional Prometheus metrics and enhanced logging.
+**Observability, Testing, and Documentation Release** - Patch release adding optional Prometheus metrics, code coverage, benchmark checks, and comprehensive testing documentation.
 
 ### Added
 
@@ -27,13 +27,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Detailed context for dataset retrieval (field_count, tag_count, lineage counts)
   - All logs include request_id for correlation
 
+- **Code Coverage Integration**
+  - New `.github/workflows/coverage.yml` workflow using cargo-tarpaulin
+  - Codecov integration for coverage tracking and reporting
+  - Coverage badge in README.md
+  - Informational-only (doesn't block PRs)
+  - Separate coverage runs for default and metrics features
+
+- **Benchmark Compile Checks**
+  - New benchmark compile check in CI workflow
+  - Prevents benchmark bit-rot without running expensive performance tests
+  - Scheduled weekly benchmark runs (`.github/workflows/benchmarks.yml`)
+  - Benchmark results archived for 90 days
+  - Performance regression alerts (50% threshold)
+
 - **Monitoring Documentation**
-  - Comprehensive `docs/METRICS.md` guide
+  - Comprehensive `docs/METRICS.md` guide (300+ lines)
   - Prometheus configuration examples
   - Grafana dashboard JSON template (`docs/grafana-dashboard.json`)
   - Security best practices for `/metrics` endpoint
   - Docker Compose example with Prometheus + Grafana
   - Sample PromQL queries for common monitoring scenarios
+
+- **Cloud Emulator Testing Documentation**
+  - Comprehensive `docs/cloud-emulator-tests.md` guide (600+ lines)
+  - Covers GCS (fake-gcs-server) and S3 (MinIO) emulator testing
+  - Best practices, common patterns, and troubleshooting
+  - Architecture diagrams and test case examples
+  - Security considerations and CI/CD integration
+  - Updated `docs/for-developers.md` with cloud emulator section
+  - Updated `CONTRIBUTING.md` with emulator testing guidelines
+  - Updated README.md with improved emulator test section
 
 - **Examples**
   - `examples/metrics_demo.rs` - Quick start guide for metrics feature
@@ -45,11 +69,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `lazy_static = "1.4"` (optional)
   - No new required dependencies
 
+- **CI/CD**
+  - Added coverage workflow (Linux-only, informational)
+  - Added benchmark compile check to main CI workflow
+  - Added scheduled weekly benchmarks workflow
+
 ### Migration Notes
 
 No migration required - this is a **non-breaking patch release**. All v0.4.1 code continues to work unchanged.
 
 **For production deployments:** Metrics feature is opt-in. Enable by building with `--features metrics`. See `docs/METRICS.md` for security considerations when exposing `/metrics` in production.
+
+**For contributors:** Cloud emulator tests require Docker and `RUN_CLOUD_TESTS=1` environment variable. See `docs/cloud-emulator-tests.md` for comprehensive testing guide.
 
 ---
 

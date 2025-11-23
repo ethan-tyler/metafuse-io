@@ -134,6 +134,44 @@ If this passes locally, it will pass in CI.
 - Test both success and error paths
 - Aim for meaningful coverage, not just high percentages
 
+### Cloud Emulator Testing
+
+MetaFuse includes integration tests for cloud backends (GCS and S3) using Docker-based emulators. These tests are **optional** for most contributions but **required** if you're modifying cloud backend code.
+
+**When to run emulator tests:**
+
+- When modifying cloud storage backend code (`catalog-storage/src/gcs.rs`, `catalog-storage/src/s3.rs`)
+- When changing versioning, concurrency, or retry logic
+- Before submitting PRs that affect cloud functionality
+
+**Requirements:**
+
+- Docker installed and running
+- `RUN_CLOUD_TESTS=1` environment variable
+
+**Running emulator tests:**
+
+```bash
+# GCS emulator tests (requires Docker)
+RUN_CLOUD_TESTS=1 cargo test --features gcs --test gcs_emulator_tests
+
+# S3 emulator tests (requires Docker)
+RUN_CLOUD_TESTS=1 cargo test --features s3 --test s3_emulator_tests
+
+# Skip emulator tests (default)
+cargo test --features cloud  # Emulator tests are skipped without RUN_CLOUD_TESTS
+```
+
+**What emulator tests cover:**
+
+- Catalog initialization and versioning (GCS generations, S3 ETags)
+- Concurrent write detection and conflict handling
+- Retry logic with exponential backoff
+- Cache behavior
+- Metadata preservation
+
+For detailed documentation on writing and debugging emulator tests, see [Cloud Emulator Testing Guide](docs/cloud-emulator-tests.md).
+
 ### Documentation
 
 - Add `///` doc comments for all public items
