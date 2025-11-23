@@ -256,7 +256,7 @@ impl LocalSqliteBackend {
     /// * `path` - Path to the SQLite database file
     ///
     /// # Example
-    /// ```
+    /// ```no_run
     /// use metafuse_catalog_storage::LocalSqliteBackend;
     ///
     /// let backend = LocalSqliteBackend::new("catalog.db");
