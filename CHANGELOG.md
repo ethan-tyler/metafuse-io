@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2025-01-22
+
+**Observability & Monitoring Release** - Patch release adding optional Prometheus metrics and enhanced logging.
+
+### Added
+
+- **Prometheus Metrics (Optional, Feature-Gated)**
+  - Opt-in `metrics` feature flag for Prometheus monitoring
+  - `/metrics` endpoint for Prometheus scraping (only when feature enabled)
+  - HTTP request metrics: `http_requests_total`, `http_request_duration_seconds`
+  - Catalog operation metrics: `catalog_operations_total`, `catalog_datasets_total`
+  - Feature disabled by default - no impact on default builds
+  - Run with: `cargo run --features metrics -p metafuse-catalog-api`
+
+- **Enhanced Structured Logging**
+  - Added structured fields to all API handlers (tenant, domain, query params)
+  - Result counts logged for list/search operations
+  - Detailed context for dataset retrieval (field_count, tag_count, lineage counts)
+  - All logs include request_id for correlation
+
+- **Monitoring Documentation**
+  - Comprehensive `docs/METRICS.md` guide
+  - Prometheus configuration examples
+  - Grafana dashboard JSON template (`docs/grafana-dashboard.json`)
+  - Security best practices for `/metrics` endpoint
+  - Docker Compose example with Prometheus + Grafana
+  - Sample PromQL queries for common monitoring scenarios
+
+- **Examples**
+  - `examples/metrics_demo.rs` - Quick start guide for metrics feature
+
+### Changed
+
+- **Dependencies**
+  - Added `prometheus = "0.13"` (optional)
+  - Added `lazy_static = "1.4"` (optional)
+  - No new required dependencies
+
+### Migration Notes
+
+No migration required - this is a **non-breaking patch release**. All v0.4.1 code continues to work unchanged.
+
+**For production deployments:** Metrics feature is opt-in. Enable by building with `--features metrics`. See `docs/METRICS.md` for security considerations when exposing `/metrics` in production.
+
+---
+
 ## [0.4.1] - 2025-01-22
 
 **Quality & Compliance Release** - Patch release with lint enforcement and benchmark fixes.

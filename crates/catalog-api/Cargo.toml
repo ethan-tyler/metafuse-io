@@ -11,6 +11,10 @@ description = "REST API server for MetaFuse catalog"
 name = "metafuse-api"
 path = "src/main.rs"
 
+[features]
+default = []
+metrics = ["prometheus", "lazy_static"]
+
 [dependencies]
 metafuse-catalog-core = { path = "../catalog-core" }
 metafuse-catalog-storage = { path = "../catalog-storage" }
@@ -26,3 +30,7 @@ tracing-subscriber.workspace = true
 chrono.workspace = true
 rusqlite.workspace = true
 uuid.workspace = true
+
+# Optional: Metrics
+prometheus = { workspace = true, optional = true }
+lazy_static = { workspace = true, optional = true }

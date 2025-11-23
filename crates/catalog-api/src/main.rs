@@ -2,6 +2,9 @@
 //!
 //! REST API for querying the MetaFuse catalog.
 
+#[cfg(feature = "metrics")]
+mod metrics;
+
 use axum::{
     extract::{Extension, Path, Query, Request, State},
     http::{header, HeaderValue, StatusCode},
@@ -122,13 +125,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         backend: Arc::from(backend),
     };
 
-    // Build router
-    let app = Router::new()
+    // Build router with conditional metrics endpoint
+    #[cfg_attr(not(feature = "metrics"), allow(unused_mut))]
+    let mut app = Router::new()
         .route("/health", get(health_check))
         .route("/api/v1/datasets", get(list_datasets))
         .route("/api/v1/datasets/:name", get(get_dataset))
-        .route("/api/v1/search", get(search_datasets))
+        .route("/api/v1/search", get(search_datasets));
+
+    // Add metrics endpoint if metrics feature is enabled
+    #[cfg(feature = "metrics")]
+    {
+        app = app.route("/metrics", get(metrics::metrics_handler));
+        tracing::info!("Metrics endpoint enabled at /metrics");
+    }
+
+    let app = app
         .layer(middleware::from_fn(request_id_middleware))
+        // Add metrics middleware if enabled
+        .layer({
+            #[cfg(feature = "metrics")]
+            {
+                middleware::from_fn(metrics::track_metrics)
+            }
+            #[cfg(not(feature = "metrics"))]
+            {
+                middleware::from_fn(|req: Request, next: Next| async move { next.run(req).await })
+            }
+        })
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -191,6 +215,12 @@ async fn list_datasets(
     Extension(request_id): Extension<RequestId>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<DatasetResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(
+        tenant = ?params.get("tenant"),
+        domain = ?params.get("domain"),
+        "Listing datasets with filters"
+    );
+
     let conn = state
         .backend
         .get_connection()
@@ -257,6 +287,11 @@ async fn list_datasets(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
+    tracing::info!(count = datasets.len(), "Listed datasets successfully");
+
+    #[cfg(feature = "metrics")]
+    metrics::record_catalog_operation("list_datasets", "success");
+
     Ok(Json(datasets))
 }
 
@@ -266,6 +301,8 @@ async fn get_dataset(
     Extension(request_id): Extension<RequestId>,
     Path(name): Path<String>,
 ) -> Result<Json<DatasetDetailResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(dataset_name = %name, "Getting dataset details");
+
     // Validate dataset name
     validation::validate_dataset_name(&name)
         .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
@@ -381,6 +418,18 @@ async fn get_dataset(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
+    tracing::info!(
+        dataset_name = %name,
+        field_count = fields.len(),
+        tag_count = tags.len(),
+        upstream_count = upstream_datasets.len(),
+        downstream_count = downstream_datasets.len(),
+        "Retrieved dataset details successfully"
+    );
+
+    #[cfg(feature = "metrics")]
+    metrics::record_catalog_operation("get_dataset", "success");
+
     Ok(Json(DatasetDetailResponse {
         dataset,
         fields,
@@ -399,6 +448,8 @@ async fn search_datasets(
     let query = params
         .get("q")
         .ok_or_else(|| bad_request("Missing 'q' parameter".to_string(), request_id.0.clone()))?;
+
+    tracing::debug!(search_query = %query, "Executing full-text search");
 
     // Validate FTS query (operators are allowed for powerful search)
     let validated_query = validation::validate_fts_query(query)
@@ -449,6 +500,15 @@ async fn search_datasets(
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    tracing::info!(
+        search_query = %query,
+        result_count = datasets.len(),
+        "Search completed successfully"
+    );
+
+    #[cfg(feature = "metrics")]
+    metrics::record_catalog_operation("search_datasets", "success");
 
     Ok(Json(datasets))
 }

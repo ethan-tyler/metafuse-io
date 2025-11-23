@@ -22,7 +22,7 @@ license = "Apache-2.0"
 authors = ["Ethan Urbanski <ethan@urbanskitech.com>"]
 repository = "https://github.com/ethan-tyler/MetaFuse"
 description = "MetaFuse: a lightweight, serverless data catalog for DataFusion and lakehouse pipelines."
-version = "0.4.1"
+version = "0.4.2"
 
 [workspace.lints.clippy]
 await_holding_lock = "warn"
@@ -37,6 +37,10 @@ unsafe_code = "forbid"
 serde = { version = "1", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
+
+# Metrics (optional)
+prometheus = "0.13"
+lazy_static = "1.4"
 
 # Database
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
