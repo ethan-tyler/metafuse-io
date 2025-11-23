@@ -2,6 +2,19 @@
 
 This guide covers MetaFuse's cloud emulator testing strategy for GCS and S3 backends, following industry best practices for integration testing with Docker-based emulators.
 
+## TL;DR - Quick Start
+
+```bash
+# 1. Install Docker and ensure it's running
+# 2. Run emulator tests (skipped by default without RUN_CLOUD_TESTS)
+RUN_CLOUD_TESTS=1 cargo test --features gcs --test gcs_emulator_tests  # GCS
+RUN_CLOUD_TESTS=1 cargo test --features s3 --test s3_emulator_tests    # S3
+```
+
+**What you get:** Validates cloud-specific behavior (versioning, concurrency, retries) without cloud credentials or costs. Uses Docker containers (fake-gcs-server, MinIO) that start/stop automatically.
+
+---
+
 ## Table of Contents
 
 - [Overview](#overview)

@@ -40,7 +40,7 @@ jobs:
           auto-push: false
           comment-on-alert: true
           fail-on-alert: false
-          alert-threshold: '150%'  # Alert if 50% performance regression
+          alert-threshold: '120%'  # Alert if 20% performance regression (manual review)
 
       - name: Archive benchmark results
         uses: actions/upload-artifact@v4
