@@ -14,6 +14,8 @@ path = "src/main.rs"
 [features]
 default = []
 metrics = ["prometheus", "lazy_static"]
+rate-limiting = ["dashmap"]
+api-keys = ["bcrypt", "rand", "dashmap", "hex"]
 
 [dependencies]
 metafuse-catalog-core = { path = "../catalog-core" }
@@ -34,3 +36,14 @@ uuid.workspace = true
 # Optional: Metrics
 prometheus = { workspace = true, optional = true }
 lazy_static = { workspace = true, optional = true }
+
+# Optional: Rate limiting
+dashmap = { workspace = true, optional = true }
+
+# Optional: API keys
+bcrypt = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

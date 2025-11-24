@@ -105,6 +105,7 @@ pub type Result<T> = std::result::Result<T, CatalogError>;
 /// - `glossary_terms`: Business glossary
 /// - `term_links`: Links between datasets and glossary terms
 /// - `dataset_search`: FTS5 virtual table for full-text search
+/// - `api_keys`: API key authentication (optional, feature-gated)
 pub fn init_sqlite_schema(conn: &rusqlite::Connection) -> Result<()> {
     let ddl = r#"
     -- Version control for optimistic concurrency
@@ -204,6 +205,24 @@ pub fn init_sqlite_schema(conn: &rusqlite::Connection) -> Result<()> {
     CREATE INDEX IF NOT EXISTS idx_term_links_term ON term_links(term_id);
     CREATE INDEX IF NOT EXISTS idx_term_links_dataset ON term_links(dataset_id);
     CREATE INDEX IF NOT EXISTS idx_term_links_field ON term_links(field_id);
+
+    -- API key authentication table (always created for schema stability)
+    -- Used when 'api-keys' feature is enabled. Creating it unconditionally:
+    -- 1. Prevents migration issues when enabling/disabling features
+    -- 2. Ensures consistent database schema across deployments
+    -- 3. Allows zero-downtime feature enablement
+    -- The table is harmless when unused and enables CLI commands regardless of API feature state
+    CREATE TABLE IF NOT EXISTS api_keys (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      key_hash TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      revoked_at TEXT,
+      last_used_at TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash);
+    CREATE INDEX IF NOT EXISTS idx_api_keys_revoked_at ON api_keys(revoked_at);
 
     -- Full-text search virtual table
     CREATE VIRTUAL TABLE IF NOT EXISTS dataset_search USING fts5(
@@ -382,6 +401,7 @@ mod tests {
         assert!(tables.contains(&"lineage".to_string()));
         assert!(tables.contains(&"tags".to_string()));
         assert!(tables.contains(&"glossary_terms".to_string()));
+        assert!(tables.contains(&"api_keys".to_string()));
     }
 
     #[test]

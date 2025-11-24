@@ -319,8 +319,10 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## Community
 
+- **Community Guide**: [docs/COMMUNITY.md](docs/COMMUNITY.md) - How to participate and get help
 - **Issues**: [Report bugs or request features](https://github.com/ethan-tyler/MetaFuse/issues)
 - **Discussions**: [Ask questions](https://github.com/ethan-tyler/MetaFuse/discussions)
+- **Contributing**: [CONTRIBUTING.md](CONTRIBUTING.md) - Development guidelines
 
 ## License
 

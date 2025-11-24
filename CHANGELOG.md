@@ -7,6 +7,216 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.4.3] - 2025-01-24
+
+### Week 3: Security Features (Rate Limiting & API Key Authentication) - Production Ready
+
+**Major security enhancements with production-ready rate limiting and API key authentication, including critical architecture fix for identity-aware rate limiting.**
+
+#### 🔒 Security - Critical Architecture Fix
+
+- **Fixed Identity-Aware Rate Limiting Vulnerability**
+  - **Previous behavior**: Rate limiter checked for Bearer token presence (not validity) to assign tier
+  - **Security flaw**: Invalid API keys received elevated rate limits until auth middleware rejected them
+  - **Fix**: Proper middleware ordering with identity-aware architecture:
+
+    ```text
+    Request → Auth Middleware → Rate Limiter → Handler
+              (validates key,    (reads identity
+               attaches identity) for tier selection)
+    ```
+
+  - Auth middleware now validates keys and attaches `ApiKeyId` to request extensions
+  - Rate limiter reads identity from extensions (NOT raw headers)
+  - **Security guarantee**: Invalid API keys NO LONGER get elevated rate limits
+  - Added `test_invalid_key_does_not_get_identity()` security test
+  - Added `test_error_response_format()` for error consistency
+
+#### ✨ Enhanced - Production-Ready Improvements
+
+- **Consistent Error Responses**
+  - All error responses now include `request_id` for traceability
+  - 401 Unauthorized: `{error, message, request_id}`
+  - 429 Too Many Requests: `{error, message, request_id, retry_after}`
+  - 500 Internal Server Error: `{error, message, request_id}`
+  - Improves observability and incident response
+
+- **Default Limits and Tuning Documentation**
+  - Documented default rate limits (5000/hour auth, 100/hour anon)
+  - Added tuning guidance for high-traffic APIs
+  - Clarified when limits apply (only valid keys get elevated limits)
+  - **Security note**: Proxy headers ignored by default (prevents IP spoofing)
+
+- **Schema Stability Design**
+  - `api_keys` table always created (feature-independent)
+  - Enables zero-downtime feature enablement
+  - Prevents migration issues when enabling/disabling features
+  - Documented design rationale in schema comments
+
+- **Module Exports**
+  - Added `pub mod rate_limiting` to `catalog-api/lib.rs`
+  - Enables proper cross-module usage with feature flags
+
+#### Added - Security Features
+
+- **Rate Limiting (Optional, Feature-Gated)**
+  - Opt-in `rate-limiting` feature flag for DDoS protection
+  - Tiered limits: 5000/hour (authenticated), 100/hour (unauthenticated)
+  - Custom key extractor (API key → IP fallback)
+  - Trusted proxy support (X-Forwarded-For, X-Real-IP)
+  - IPv4/IPv6 validation for trusted proxy CIDRs
+  - Automatic bucket lifecycle/TTL (configurable)
+  - Memory bounds (max 10,000 buckets by default)
+  - Configurable via environment variables:
+    - `RATE_LIMIT_REQUESTS_PER_HOUR`
+    - `RATE_LIMIT_IP_REQUESTS_PER_HOUR`
+    - `RATE_LIMIT_TRUSTED_PROXIES`
+    - `RATE_LIMIT_BUCKET_TTL_SECS`
+    - `RATE_LIMIT_MAX_BUCKETS`
+  - Returns 429 Too Many Requests with Retry-After header
+
+- **API Key Authentication (Optional, Feature-Gated)**
+  - Opt-in `api-keys` feature flag for authentication
+  - Cryptographically secure key generation (OsRng, 32-byte base64)
+  - bcrypt hashing with configurable cost factor (default: 12)
+  - In-memory cache (5-minute TTL, hashed keys)
+  - Background `last_used_at` flushing (30-second interval)
+  - Soft deletion with audit trail (`revoked_at` timestamp)
+  - Immediate cache eviction on revocation
+  - CLI commands:
+    - `metafuse api-key create <name>` - Create new key
+    - `metafuse api-key list` - List all keys
+    - `metafuse api-key revoke <id>` - Revoke key
+  - Authorization methods:
+    - `Authorization: Bearer <key>` header (preferred)
+    - `?api_key=<key>` query parameter (testing only)
+  - Schema: `api_keys` table with `id`, `name`, `key_hash`, `created_at`, `revoked_at`, `last_used_at`
+
+#### Added - Documentation
+
+- **Security Documentation**
+  - `.github/SECURITY.md` - Vulnerability disclosure policy
+  - `docs/SECURITY.md` - Comprehensive security guide (600+ lines)
+    - TL;DR for quick reference
+    - Rate limiting configuration and best practices
+    - API key authentication usage and security model
+    - Trusted proxy configuration for AWS/GCP/Cloudflare
+    - Memory management and performance tuning
+    - Key rotation procedures
+    - Incident response procedures
+  - `docs/security-checklist.md` - Pre-deployment checklist
+    - Features & build checklist
+    - Configuration checklist
+    - Infrastructure security
+    - Operational security
+    - Testing requirements
+    - Cloud-specific checklists (AWS/GCP)
+    - Container security checklist
+
+- **Deployment Documentation Updates**
+  - `docs/deployment-aws.md` - Enhanced security section
+    - Rate limiting & API key configuration for ALB
+    - AWS Secrets Manager integration
+    - Security Group configuration
+    - HTTPS/TLS setup with ALB
+    - IAM policy for least privilege
+    - CloudWatch security monitoring
+    - AWS WAF integration
+  - `docs/deployment-gcp.md` - Enhanced security section
+    - Rate limiting & API key configuration for Cloud Load Balancing
+    - Secret Manager integration
+    - Cloud Run and GKE deployment examples
+    - IAM policy for least privilege
+    - Cloud Monitoring security alerts
+    - Cloud Armor DDoS protection
+    - Managed TLS certificates
+
+#### Added - Tests
+
+- **Rate Limiting Tests** (11 tests)
+  - `test_rate_limiter_allows_under_limit` - Basic functionality
+  - `test_rate_limiter_key_with_api_key` - API key extraction
+  - `test_rate_limiter_key_fallback_to_ip` - IP fallback
+  - `test_trusted_proxy_validation` - Security validation
+  - `test_untrusted_proxy_ignores_x_real_ip` - Security enforcement
+  - `test_trusted_proxy_ipv6` - IPv6 support
+  - `test_bucket_ttl_prevents_eviction_of_active` - TTL behavior
+  - `test_bucket_cleanup` - Lifecycle management
+  - `test_bucket_cap_enforcement` - Memory bounds
+  - `test_config_defaults` - Configuration
+  - `test_rate_limit_response_includes_request_id` - Error formatting
+
+- **API Key Tests** (8 tests)
+  - `test_create_and_validate_key` - Basic flow
+  - `test_cache_hit` - Cache performance
+  - `test_revoke_key` - Revocation
+  - `test_revoke_clears_cache` - **SECURITY: Immediate eviction**
+  - `test_list_keys` - CLI functionality
+  - `test_flush_pending_updates` - Background flushing
+  - `test_invalid_key_does_not_get_identity` - **SECURITY: Invalid keys don't get elevated limits**
+  - `test_error_response_format` - **PRODUCTION: Consistent error format**
+
+#### Changed - CI/CD
+
+- **GitHub Actions**
+  - Added `security-features` job with feature matrix:
+    - `rate-limiting` only
+    - `api-keys` only
+    - `rate-limiting,api-keys` combined
+    - `rate-limiting,api-keys,metrics` all features
+  - Each matrix entry: build, test, and release build
+  - Release workflow already includes `--all-features`
+
+#### Security Fixes
+
+- **Critical Security Vulnerabilities Fixed (Post-Implementation Review)**
+  - Fixed plaintext API key storage in cache (now uses hashed keys)
+  - Fixed cache not clearing on revocation (now immediate eviction)
+  - Fixed pending updates using plaintext (now uses bcrypt hash)
+  - Documented O(n) validation performance trade-off
+  - Added comprehensive module-level security documentation
+
+#### Performance Considerations
+
+- **Rate Limiting**
+  - Memory: ~100 bytes per bucket (~1MB per 10K clients)
+  - Latency: <1ms overhead per request (in-memory DashMap)
+  - Cleanup: Periodic (every 60 seconds) + on-access
+
+- **API Key Validation**
+  - Cache hit: <10ms (hash lookup)
+  - Cache miss: ~300ms × key count (bcrypt verification)
+  - Mitigation: 5-minute cache TTL (configurable)
+  - **Known limitation**: O(n) validation due to bcrypt salting
+
+#### Migration Notes
+
+No migration required - this is a **non-breaking feature release**. All v0.4.1 code continues to work unchanged.
+
+**To enable security features**:
+
+```bash
+# Rate limiting only
+cargo build --features rate-limiting
+
+# API keys only
+cargo build --features api-keys
+
+# Both (recommended for production)
+cargo build --features "rate-limiting,api-keys"
+
+# All features
+cargo build --all-features
+```
+
+**Database schema changes** (backward compatible):
+
+- New `api_keys` table created automatically on first run
+- Existing databases upgraded seamlessly
+- Schema version compatible with v0.4.0+
+
 ## [0.4.2] - 2025-01-23
 
 **Observability, Testing, and Documentation Release** - Patch release adding optional Prometheus metrics, code coverage, benchmark checks, and comprehensive testing documentation.

@@ -446,6 +446,8 @@ spec:
 
 ### Security
 
+#### Core Security Hardening
+
 1. **Use Workload Identity** instead of service account keys in GKE
 2. **Restrict bucket access** to specific service accounts only
 3. **Enable VPC Service Controls** for sensitive data
@@ -456,6 +458,275 @@ spec:
 # Enable audit logs
 gcloud projects set-iam-policy $PROJECT_ID policy.yaml
 ```
+
+#### Rate Limiting & API Key Authentication
+
+**Build with security features**:
+
+```bash
+# Build with both rate limiting and API key authentication
+docker build \
+  --build-arg FEATURES="rate-limiting,api-keys" \
+  -t gcr.io/$PROJECT_ID/metafuse-api:latest .
+
+# Push to Google Container Registry
+docker push gcr.io/$PROJECT_ID/metafuse-api:latest
+```
+
+**Configure trusted proxies for Cloud Load Balancing**:
+
+```bash
+# GCP Cloud Load Balancer uses specific IP ranges
+# Set in Cloud Run or GKE deployment
+env:
+  - name: RATE_LIMIT_TRUSTED_PROXIES
+    value: "130.211.0.0/22,35.191.0.0/16"
+  - name: RATE_LIMIT_REQUESTS_PER_HOUR
+    value: "5000"  # Authenticated clients
+  - name: RATE_LIMIT_IP_REQUESTS_PER_HOUR
+    value: "100"   # Unauthenticated clients
+```
+
+**Store API keys in Secret Manager**:
+
+```bash
+# Create API key using CLI (run once)
+metafuse api-key create "production-api" > /tmp/key.txt
+
+# Extract the key value
+API_KEY=$(grep "API Key:" /tmp/key.txt | awk '{print $3}')
+
+# Store in Secret Manager
+echo -n "$API_KEY" | gcloud secrets create metafuse-api-key \
+  --data-file=- \
+  --replication-policy="automatic" \
+  --project=$PROJECT_ID
+
+# Clean up temporary file
+rm -f /tmp/key.txt
+
+# Grant access to service account
+gcloud secrets add-iam-policy-binding metafuse-api-key \
+  --member="serviceAccount:metafuse-api@$PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+
+# Retrieve in Cloud Run (automatic via volume mount)
+# Or in GKE using Workload Identity and Secret Store CSI driver
+```
+
+**Cloud Run deployment with security**:
+
+```bash
+gcloud run deploy metafuse-api \
+  --image gcr.io/$PROJECT_ID/metafuse-api:latest \
+  --platform managed \
+  --region $REGION \
+  --allow-unauthenticated \
+  --port 8080 \
+  --set-env-vars RATE_LIMIT_TRUSTED_PROXIES="130.211.0.0/22,35.191.0.0/16" \
+  --set-env-vars RATE_LIMIT_REQUESTS_PER_HOUR=5000 \
+  --set-env-vars RATE_LIMIT_IP_REQUESTS_PER_HOUR=100 \
+  --set-secrets="/etc/secrets/api-key=metafuse-api-key:latest" \
+  --service-account metafuse-api@$PROJECT_ID.iam.gserviceaccount.com \
+  --min-instances 1 \
+  --max-instances 10 \
+  --memory 512Mi \
+  --cpu 1
+```
+
+**GKE deployment with security**:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metafuse-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: metafuse-api
+  template:
+    metadata:
+      labels:
+        app: metafuse-api
+    spec:
+      serviceAccountName: metafuse-api
+      containers:
+      - name: metafuse-api
+        image: gcr.io/PROJECT_ID/metafuse-api:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: RATE_LIMIT_TRUSTED_PROXIES
+          value: "130.211.0.0/22,35.191.0.0/16"
+        - name: RATE_LIMIT_REQUESTS_PER_HOUR
+          value: "5000"
+        - name: RATE_LIMIT_IP_REQUESTS_PER_HOUR
+          value: "100"
+        volumeMounts:
+        - name: api-key
+          mountPath: "/etc/secrets"
+          readOnly: true
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1001
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+      volumes:
+      - name: api-key
+        secret:
+          secretName: metafuse-api-key
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: metafuse-api
+spec:
+  type: LoadBalancer
+  selector:
+    app: metafuse-api
+  ports:
+  - port: 443
+    targetPort: 8080
+    protocol: TCP
+```
+
+**IAM policy for least privilege**:
+
+```bash
+# Create service account
+gcloud iam service-accounts create metafuse-api \
+  --display-name="MetaFuse API Service Account"
+
+# Grant GCS access
+gcloud storage buckets add-iam-policy-binding gs://metafuse-catalog-prod \
+  --member="serviceAccount:metafuse-api@$PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/storage.objectAdmin"
+
+# Grant Secret Manager access
+gcloud secrets add-iam-policy-binding metafuse-api-key \
+  --member="serviceAccount:metafuse-api@$PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+
+# Bind Workload Identity (for GKE)
+gcloud iam service-accounts add-iam-policy-binding \
+  metafuse-api@$PROJECT_ID.iam.gserviceaccount.com \
+  --role roles/iam.workloadIdentityUser \
+  --member "serviceAccount:$PROJECT_ID.svc.id.goog[default/metafuse-api]"
+```
+
+**Enable Cloud Armor for DDoS protection**:
+
+```bash
+# Create security policy
+gcloud compute security-policies create metafuse-armor \
+  --description "MetaFuse API protection"
+
+# Add rate limiting rule
+gcloud compute security-policies rules create 1000 \
+  --security-policy metafuse-armor \
+  --expression "true" \
+  --action "rate-based-ban" \
+  --rate-limit-threshold-count 100 \
+  --rate-limit-threshold-interval-sec 60 \
+  --ban-duration-sec 600 \
+  --conform-action allow \
+  --exceed-action deny-429 \
+  --enforce-on-key IP
+
+# Add geo-blocking (example: allow only US traffic)
+gcloud compute security-policies rules create 2000 \
+  --security-policy metafuse-armor \
+  --expression "origin.region_code != 'US'" \
+  --action deny-403
+
+# Attach to backend service
+gcloud compute backend-services update metafuse-backend \
+  --security-policy metafuse-armor \
+  --global
+```
+
+**Security monitoring with Cloud Monitoring**:
+
+```bash
+# Create alert for rate limit violations
+gcloud alpha monitoring policies create \
+  --notification-channels=$CHANNEL_ID \
+  --display-name="MetaFuse Rate Limit Exceeded" \
+  --condition-display-name="429 Response Rate >5%" \
+  --condition-threshold-value=5 \
+  --condition-threshold-duration=300s \
+  --condition-filter='
+    resource.type="cloud_run_revision"
+    AND resource.labels.service_name="metafuse-api"
+    AND metric.type="run.googleapis.com/request_count"
+    AND metric.labels.response_code_class="4xx"'
+
+# Create alert for authentication failures
+gcloud alpha monitoring policies create \
+  --notification-channels=$CHANNEL_ID \
+  --display-name="MetaFuse Auth Failures" \
+  --condition-display-name="401 Response Rate >1%" \
+  --condition-threshold-value=1 \
+  --condition-threshold-duration=300s \
+  --condition-filter='
+    resource.type="cloud_run_revision"
+    AND resource.labels.service_name="metafuse-api"
+    AND metric.type="run.googleapis.com/request_count"
+    AND metric.labels.response_code="401"'
+```
+
+**HTTPS/TLS configuration**:
+
+```bash
+# Cloud Run automatically provides HTTPS
+# For GKE with Ingress:
+
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: metafuse-ingress
+  annotations:
+    kubernetes.io/ingress.class: "gce"
+    networking.gke.io/managed-certificates: "metafuse-cert"
+    kubernetes.io/ingress.allow-http: "false"
+spec:
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: metafuse-api
+            port:
+              number: 443
+---
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: metafuse-cert
+spec:
+  domains:
+  - api.example.com
+EOF
+```
+
+**For complete security guidance, see**:
+
+- [docs/SECURITY.md](../SECURITY.md) - Comprehensive security guide
+- [docs/security-checklist.md](../security-checklist.md) - Pre-deployment checklist
+- [.github/SECURITY.md](../.github/SECURITY.md) - Vulnerability reporting
 
 ### Reliability
 

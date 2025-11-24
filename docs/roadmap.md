@@ -2,11 +2,11 @@
 
 This document outlines the planned development phases for MetaFuse.
 
-## Current Status: Phase 2 (v0.3.0) Complete ✓
+## Current Status: Phase 2.5 (v0.4.2) Complete ✓
 
-MetaFuse v0.3.0 is cloud-ready with multi-cloud backend support for GCS and S3.
+MetaFuse v0.4.2 is production-ready with enterprise-grade security features including rate limiting and API key authentication.
 
-**Latest Release**: v0.3.0 - Cloud-Ready Release (January 2025)
+**Latest Release**: v0.4.2 - Security & Authentication Release (January 2025)
 
 ---
 
@@ -164,7 +164,81 @@ MetaFuse v0.3.0 is cloud-ready with multi-cloud backend support for GCS and S3.
 
 ---
 
-## Phase 2.1: Cloud Backend Enhancements (v0.3.1 - Q2 2025)
+## Phase 2.5: Security & Authentication ✓ [Complete] (January 2025)
+
+**Released**: v0.4.0 - v0.4.2 (January 2025)
+
+**Goal:** Add production-grade security features for API protection and access control.
+
+### Completed
+
+- [done] **Rate Limiting**
+  - Identity-aware tiered rate limits (5000/hour authenticated, 100/hour anonymous)
+  - Trusted proxy support (X-Forwarded-For, X-Real-IP with validation)
+  - IPv4/IPv6 support with CIDR-based proxy configuration
+  - Memory-bounded with automatic bucket cleanup (TTL-based eviction)
+  - In-memory DashMap for high-performance concurrent access
+  - Configurable via environment variables
+
+- [done] **API Key Authentication**
+  - Cryptographically secure key generation (OsRng, 32-byte keys)
+  - bcrypt password hashing (cost factor: 12)
+  - In-memory caching (5-minute TTL) for performance
+  - Background flush for last-used-at tracking
+  - Soft deletion with audit trail preservation
+  - CLI commands for key management (`create`, `list`, `revoke`)
+
+- [done] **Identity-Aware Middleware Architecture**
+  - Auth middleware validates keys and attaches identity to request extensions
+  - Rate limiter reads identity from extensions (NOT raw headers)
+  - Invalid API keys fall back to anonymous (IP-based) rate limits
+  - Security guarantee: Invalid keys do NOT get elevated rate limits
+
+- [done] **Production-Ready Error Responses**
+  - Consistent JSON error format with request_id for traceability
+  - 401 Unauthorized (invalid/missing API key)
+  - 429 Too Many Requests (rate limit exceeded with retry_after)
+  - 500 Internal Server Error (validation failures)
+
+- [done] **Comprehensive Security Documentation**
+  - SECURITY.md with deployment best practices
+  - security-checklist.md for pre-production verification
+  - Trusted proxy configuration guides (AWS, GCP, Cloudflare)
+  - Rate limit tuning guidance with examples
+  - Key rotation procedures and incident response
+
+- [done] **Feature Flags for Modular Compilation**
+  - `api-keys` feature for authentication
+  - `rate-limiting` feature for rate limiting
+  - `metrics` feature for observability
+  - Zero-dependency builds when features disabled
+
+- [done] **Security Testing & Validation**
+  - 19 tests for API keys (validation, caching, revocation)
+  - 11 tests for rate limiting (tiering, proxy validation, cleanup)
+  - Security test verifying invalid keys don't get elevated limits
+  - CI matrix testing all feature combinations
+
+- [done] **Schema Stability**
+  - `api_keys` table always created (feature-independent)
+  - Enables zero-downtime feature enablement
+  - Documented design rationale for schema decisions
+
+### Security Guarantee
+
+**Critical Fix**: Invalid API keys do NOT receive elevated rate limits because the architecture enforces proper separation of concerns:
+
+```text
+Request → Auth Middleware → Rate Limiter → Handler
+          (validates key,    (reads identity
+           attaches identity) for tier selection)
+```
+
+Only validated API keys get identity attached, ensuring attackers cannot bypass rate limits with invalid credentials.
+
+---
+
+## Phase 2.1: Cloud Backend Enhancements (v0.5.0 - Q2 2025)
 
 **Goal:** Improve cloud backend performance, testing, and developer experience.
 
@@ -280,6 +354,14 @@ MetaFuse v0.3.0 is cloud-ready with multi-cloud backend support for GCS and S3.
 
 **Goal:** Provide enterprise-ready features for larger organizations.
 
+### Completed Early
+
+- [done] **API Key Authentication** (completed in v0.4.2)
+  - Cryptographically secure key generation and bcrypt hashing
+  - In-memory caching with TTL-based expiration
+  - CLI management commands and soft deletion
+  - See Phase 2.5 for full details
+
 ### Planned Features
 
 - **Multi-Tenant Hosted Service**
@@ -287,8 +369,7 @@ MetaFuse v0.3.0 is cloud-ready with multi-cloud backend support for GCS and S3.
   - Tenant isolation and resource quotas
   - Subscription tiers (free, team, enterprise)
 
-- **Authentication and Authorization**
-  - API key authentication
+- **Advanced Authentication and Authorization**
   - OAuth2/OIDC SSO (Google, Okta, Azure AD)
   - Role-based access control (RBAC)
     - Reader, Writer, Admin roles
@@ -369,9 +450,11 @@ Features suggested by the community (not yet prioritized):
 | 0.1.0   | Jan 2025     | ✓ Released   | MVP - Core functionality               |
 | 0.2.0   | Jan 2025     | ✓ Released   | Production hardening                   |
 | 0.3.0   | Jan 2025     | ✓ Released   | Cloud backends (GCS/S3)                |
-| 0.3.1   | Q2 2025      | Planned      | Async backends + emulator tests        |
-| 0.4.0   | Q2-Q3 2025   | Planned      | Web UI + community launch              |
-| 0.5.0   | Q3-Q4 2025   | Planned      | Usage analytics + integrations         |
+| 0.4.0   | Jan 2025     | ✓ Released   | Security features (rate limiting)      |
+| 0.4.1   | Jan 2025     | ✓ Released   | Async emitter benchmarks               |
+| 0.4.2   | Jan 2025     | ✓ Released   | API key authentication                 |
+| 0.5.0   | Q2 2025      | Planned      | Async backends + emulator tests        |
+| 0.6.0   | Q2-Q3 2025   | Planned      | Web UI + community launch              |
 | 1.0.0   | Q1 2026      | Planned      | Stable release + enterprise features   |
 
 ---

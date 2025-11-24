@@ -6,6 +6,9 @@ use clap::{Parser, Subcommand};
 use metafuse_catalog_core::validation;
 use metafuse_catalog_storage::backend_from_uri;
 
+#[cfg(feature = "api-keys")]
+extern crate metafuse_catalog_api;
+
 #[derive(Parser)]
 #[command(name = "metafuse")]
 #[command(version, about = "MetaFuse catalog CLI", long_about = None)]
@@ -60,6 +63,32 @@ enum Commands {
 
     /// Show catalog statistics
     Stats,
+
+    #[cfg(feature = "api-keys")]
+    /// Manage API keys
+    Keys {
+        #[command(subcommand)]
+        command: KeyCommands,
+    },
+}
+
+#[cfg(feature = "api-keys")]
+#[derive(Subcommand)]
+enum KeyCommands {
+    /// Create a new API key
+    Create {
+        /// Name/description for the key
+        name: String,
+    },
+
+    /// List all API keys
+    List,
+
+    /// Revoke an API key by ID
+    Revoke {
+        /// ID of the key to revoke
+        id: i64,
+    },
 }
 
 #[tokio::main]
@@ -76,6 +105,12 @@ async fn main() {
         Commands::Show { name, lineage } => show_dataset(&cli.catalog, &name, lineage).await,
         Commands::Search { query } => search_datasets(&cli.catalog, &query).await,
         Commands::Stats => show_stats(&cli.catalog).await,
+        #[cfg(feature = "api-keys")]
+        Commands::Keys { command } => match command {
+            KeyCommands::Create { name } => create_api_key(&cli.catalog, name).await,
+            KeyCommands::List => list_api_keys(&cli.catalog).await,
+            KeyCommands::Revoke { id } => revoke_api_key(&cli.catalog, id).await,
+        },
     };
 
     if let Err(e) = result {
@@ -483,4 +518,74 @@ fn format_bytes(bytes: i64) -> String {
     }
 
     format!("{:.2} {}", size, UNITS[unit_idx])
+}
+
+#[cfg(feature = "api-keys")]
+async fn create_api_key(path: &str, name: String) -> Result<(), Box<dyn std::error::Error>> {
+    use metafuse_catalog_api::api_keys::ApiKeyManager;
+
+    let manager = ApiKeyManager::new(path.to_string())?;
+    let plaintext = manager.create_key(name.clone()).await?;
+
+    println!("✓ Created API key: {}", name);
+    println!();
+    println!("API Key (save this - it won't be shown again!):");
+    println!("  {}", plaintext);
+    println!();
+    println!("Use this key in your requests:");
+    println!("  Authorization: Bearer {}", plaintext);
+    println!("  or");
+    println!("  ?api_key={}", plaintext);
+
+    Ok(())
+}
+
+#[cfg(feature = "api-keys")]
+async fn list_api_keys(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use metafuse_catalog_api::api_keys::ApiKeyManager;
+
+    let manager = ApiKeyManager::new(path.to_string())?;
+    let keys = manager.list_keys().await?;
+
+    if keys.is_empty() {
+        println!("No API keys found.");
+        return Ok(());
+    }
+
+    println!("API Keys:");
+    println!();
+
+    for key in keys {
+        print!("  [{}] {}", key.id, key.name);
+        if key.revoked_at.is_some() {
+            print!(" (REVOKED)");
+        }
+        println!();
+        println!("    Created: {}", key.created_at);
+        if let Some(last_used) = key.last_used_at {
+            println!("    Last Used: {}", last_used);
+        }
+        if let Some(revoked) = key.revoked_at {
+            println!("    Revoked: {}", revoked);
+        }
+        println!();
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "api-keys")]
+async fn revoke_api_key(path: &str, id: i64) -> Result<(), Box<dyn std::error::Error>> {
+    use metafuse_catalog_api::api_keys::ApiKeyManager;
+
+    let manager = ApiKeyManager::new(path.to_string())?;
+    let revoked = manager.revoke_key(id).await?;
+
+    if revoked {
+        println!("✓ Revoked API key #{}", id);
+    } else {
+        return Err(format!("API key #{} not found or already revoked", id).into());
+    }
+
+    Ok(())
 }

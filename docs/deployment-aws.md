@@ -602,6 +602,8 @@ CMD ["metafuse-api"]
 
 ### Security
 
+#### Core Security Hardening
+
 1. **Use IAM roles** instead of access keys for ECS/EKS
 2. **Enable S3 encryption** at rest (SSE-S3 or SSE-KMS)
 3. **Use VPC endpoints** for S3 to avoid internet traffic
@@ -619,6 +621,220 @@ aws s3api put-bucket-logging \
     }
   }'
 ```
+
+#### Rate Limiting & API Key Authentication
+
+**Build with security features**:
+
+```bash
+# Build with both rate limiting and API key authentication
+docker build \
+  --build-arg FEATURES="rate-limiting,api-keys" \
+  -t metafuse-api:latest .
+```
+
+**Configure trusted proxies for ALB**:
+
+```bash
+# ALB uses private IPs (RFC 1918)
+# Set in ECS task definition or Kubernetes deployment
+environment:
+  - name: RATE_LIMIT_TRUSTED_PROXIES
+    value: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+  - name: RATE_LIMIT_REQUESTS_PER_HOUR
+    value: "5000"  # Authenticated clients
+  - name: RATE_LIMIT_IP_REQUESTS_PER_HOUR
+    value: "100"   # Unauthenticated clients
+```
+
+**Store API keys in AWS Secrets Manager**:
+
+```bash
+# Create API key using CLI (run once)
+metafuse api-key create "production-api" > /tmp/key.txt
+
+# Extract the key value
+API_KEY=$(grep "API Key:" /tmp/key.txt | awk '{print $3}')
+
+# Store in Secrets Manager
+aws secretsmanager create-secret \
+  --name metafuse/api-key/production \
+  --description "MetaFuse production API key" \
+  --secret-string "$API_KEY" \
+  --region $AWS_REGION
+
+# Clean up temporary file
+rm -f /tmp/key.txt
+
+# Retrieve in application code or task definition
+aws secretsmanager get-secret-value \
+  --secret-id metafuse/api-key/production \
+  --query SecretString \
+  --output text
+```
+
+**Security Group configuration**:
+
+```bash
+# Create security group for MetaFuse
+aws ec2 create-security-group \
+  --group-name metafuse-api-sg \
+  --description "MetaFuse API security group" \
+  --vpc-id vpc-xxx
+
+# Allow inbound from ALB only (not public)
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-metafuse \
+  --protocol tcp \
+  --port 8080 \
+  --source-group sg-alb
+
+# ALB security group allows 443 from anywhere
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-alb \
+  --protocol tcp \
+  --port 443 \
+  --cidr 0.0.0.0/0
+```
+
+**ALB configuration for HTTPS**:
+
+```bash
+# Create ALB with HTTPS listener
+aws elbv2 create-load-balancer \
+  --name metafuse-alb \
+  --subnets subnet-xxx subnet-yyy \
+  --security-groups sg-alb \
+  --scheme internet-facing
+
+# Create target group
+aws elbv2 create-target-group \
+  --name metafuse-tg \
+  --protocol HTTP \
+  --port 8080 \
+  --vpc-id vpc-xxx \
+  --health-check-path /health \
+  --health-check-interval-seconds 30
+
+# Add HTTPS listener with ACM certificate
+aws elbv2 create-listener \
+  --load-balancer-arn arn:aws:elasticloadbalancing:... \
+  --protocol HTTPS \
+  --port 443 \
+  --certificates CertificateArn=arn:aws:acm:... \
+  --default-actions Type=forward,TargetGroupArn=arn:aws:elasticloadbalancing:...
+
+# Redirect HTTP to HTTPS
+aws elbv2 create-listener \
+  --load-balancer-arn arn:aws:elasticloadbalancing:... \
+  --protocol HTTP \
+  --port 80 \
+  --default-actions Type=redirect,RedirectConfig="{Protocol=HTTPS,Port=443,StatusCode=HTTP_301}"
+```
+
+**IAM policy for least privilege**:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::metafuse-catalog-prod",
+        "arn:aws:s3:::metafuse-catalog-prod/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue"
+      ],
+      "Resource": "arn:aws:secretsmanager:*:*:secret:metafuse/*"
+    }
+  ]
+}
+```
+
+**Security monitoring with CloudWatch**:
+
+```bash
+# Create alarms for security metrics
+aws cloudwatch put-metric-alarm \
+  --alarm-name metafuse-rate-limit-exceeded \
+  --alarm-description "Alert when rate limit 429 responses exceed 5%" \
+  --metric-name HTTPCode_Target_4XX_Count \
+  --namespace AWS/ApplicationELB \
+  --statistic Sum \
+  --period 300 \
+  --evaluation-periods 2 \
+  --threshold 5 \
+  --comparison-operator GreaterThanThreshold
+
+aws cloudwatch put-metric-alarm \
+  --alarm-name metafuse-auth-failures \
+  --alarm-description "Alert when 401 responses exceed 1%" \
+  --metric-name HTTPCode_Target_4XX_Count \
+  --namespace AWS/ApplicationELB \
+  --statistic Sum \
+  --period 300 \
+  --evaluation-periods 2 \
+  --threshold 1 \
+  --comparison-operator GreaterThanThreshold
+```
+
+**Enable AWS WAF for additional protection**:
+
+```bash
+# Create Web ACL with rate limiting
+aws wafv2 create-web-acl \
+  --name metafuse-waf \
+  --scope REGIONAL \
+  --region $AWS_REGION \
+  --default-action Allow={} \
+  --rules file://waf-rules.json
+
+# Example waf-rules.json
+cat > waf-rules.json <<'EOF'
+[
+  {
+    "Name": "RateLimitRule",
+    "Priority": 1,
+    "Statement": {
+      "RateBasedStatement": {
+        "Limit": 2000,
+        "AggregateKeyType": "IP"
+      }
+    },
+    "Action": {
+      "Block": {}
+    },
+    "VisibilityConfig": {
+      "SampledRequestsEnabled": true,
+      "CloudWatchMetricsEnabled": true,
+      "MetricName": "RateLimitRule"
+    }
+  }
+]
+EOF
+
+# Associate WAF with ALB
+aws wafv2 associate-web-acl \
+  --web-acl-arn arn:aws:wafv2:... \
+  --resource-arn arn:aws:elasticloadbalancing:...
+```
+
+**For complete security guidance, see**:
+
+- [docs/SECURITY.md](../SECURITY.md) - Comprehensive security guide
+- [docs/security-checklist.md](../security-checklist.md) - Pre-deployment checklist
+- [.github/SECURITY.md](../.github/SECURITY.md) - Vulnerability reporting
 
 ### Reliability
 

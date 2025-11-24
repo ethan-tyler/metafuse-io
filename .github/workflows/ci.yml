@@ -45,6 +45,38 @@ jobs:
       - name: Test metrics feature
         run: cargo test -p metafuse-catalog-api --features metrics --verbose
 
+  security-features:
+    name: Security Features Matrix
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features:
+          - "rate-limiting"
+          - "api-keys"
+          - "rate-limiting,api-keys"
+          - "rate-limiting,api-keys,metrics"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: security-${{ matrix.features }}
+
+      - name: Build with features (${{ matrix.features }})
+        run: cargo build -p metafuse-catalog-api --features "${{ matrix.features }}" --verbose
+
+      - name: Test with features (${{ matrix.features }})
+        run: cargo test -p metafuse-catalog-api --features "${{ matrix.features }}" --verbose
+
+      - name: Build release with features (${{ matrix.features }})
+        run: cargo build -p metafuse-catalog-api --release --features "${{ matrix.features }}" --verbose
+
   examples:
     name: Examples Smoke Test
     runs-on: ubuntu-latest

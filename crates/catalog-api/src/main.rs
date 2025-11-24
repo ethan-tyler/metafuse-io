@@ -5,6 +5,12 @@
 #[cfg(feature = "metrics")]
 mod metrics;
 
+#[cfg(feature = "rate-limiting")]
+mod rate_limiting;
+
+#[cfg(feature = "api-keys")]
+mod api_keys;
+
 use axum::{
     extract::{Extension, Path, Query, Request, State},
     http::{header, HeaderValue, StatusCode},
@@ -152,9 +158,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 middleware::from_fn(|req: Request, next: Next| async move { next.run(req).await })
             }
-        })
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+        });
+
+    // Add rate limiting if enabled
+    #[cfg(feature = "rate-limiting")]
+    let app = {
+        let rate_limiter = rate_limiting::create_rate_limiter();
+        tracing::info!(
+            anonymous_limit = rate_limiter.config().anonymous_limit,
+            authenticated_limit = rate_limiter.config().authenticated_limit,
+            window_secs = rate_limiter.config().window_secs,
+            "Rate limiting enabled"
+        );
+        app.layer(axum::Extension(rate_limiter))
+            .layer(middleware::from_fn(rate_limiting::rate_limit_middleware))
+    };
+
+    let app = app.layer(CorsLayer::permissive()).with_state(state);
 
     // Get port from environment or use default
     let port = std::env::var("METAFUSE_PORT")
