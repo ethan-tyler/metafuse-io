@@ -20,6 +20,7 @@ mod security_tests {
         middleware,
         response::Response,
         routing::get,
+        Extension,
         Router,
     };
     use serde_json::Value;
@@ -55,10 +56,8 @@ mod security_tests {
         // Create app with rate limiting
         let app = Router::new()
             .route("/test", get(mock_handler))
-            .layer(middleware::from_fn(move |req, next| {
-                let limiter = limiter.clone();
-                async move { rate_limiting::rate_limit_middleware(req, next, limiter).await }
-            }));
+            .layer(Extension(limiter))
+            .layer(middleware::from_fn(rate_limiting::rate_limit_middleware));
 
         // First request should succeed
         let req = Request::builder()
@@ -110,10 +109,8 @@ mod security_tests {
         // Create app with rate limiting
         let app = Router::new()
             .route("/test", get(mock_handler))
-            .layer(middleware::from_fn(move |req, next| {
-                let limiter = limiter.clone();
-                async move { rate_limiting::rate_limit_middleware(req, next, limiter).await }
-            }));
+            .layer(Extension(limiter))
+            .layer(middleware::from_fn(rate_limiting::rate_limit_middleware));
 
         // Test anonymous limit (should be 2)
         for i in 1..=2 {
@@ -174,10 +171,8 @@ mod security_tests {
         // This simulates what happens when auth middleware rejects an invalid key
         let app = Router::new()
             .route("/test", get(mock_handler))
-            .layer(middleware::from_fn(move |req, next| {
-                let limiter = limiter.clone();
-                async move { rate_limiting::rate_limit_middleware(req, next, limiter).await }
-            }));
+            .layer(Extension(limiter))
+            .layer(middleware::from_fn(rate_limiting::rate_limit_middleware));
 
         // First request with invalid API key (no ApiKeyId extension)
         let req = Request::builder()
@@ -234,10 +229,8 @@ mod security_tests {
         // Create app with rate limiting
         let app = Router::new()
             .route("/test", get(mock_handler))
-            .layer(middleware::from_fn(move |req, next| {
-                let limiter = limiter.clone();
-                async move { rate_limiting::rate_limit_middleware(req, next, limiter).await }
-            }));
+            .layer(Extension(limiter))
+            .layer(middleware::from_fn(rate_limiting::rate_limit_middleware));
 
         // Make request
         let req = Request::builder()
@@ -294,10 +287,8 @@ mod security_tests {
         // Create app with rate limiting
         let app = Router::new()
             .route("/test", get(mock_handler))
-            .layer(middleware::from_fn(move |req, next| {
-                let limiter = limiter.clone();
-                async move { rate_limiting::rate_limit_middleware(req, next, limiter).await }
-            }));
+            .layer(Extension(limiter))
+            .layer(middleware::from_fn(rate_limiting::rate_limit_middleware));
 
         // First request to establish bucket
         let req = Request::builder()
