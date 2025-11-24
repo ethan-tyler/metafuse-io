@@ -254,9 +254,8 @@ impl RateLimiter {
         let threshold = self.config.max_buckets / 2;
         if self.buckets.len() > threshold {
             let ttl = Duration::from_secs(self.config.bucket_ttl_secs);
-            self.buckets.retain(|_, bucket| {
-                now.duration_since(bucket.last_accessed) < ttl
-            });
+            self.buckets
+                .retain(|_, bucket| now.duration_since(bucket.last_accessed) < ttl);
         }
 
         let mut bucket = self
