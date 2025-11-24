@@ -230,11 +230,13 @@ MetaFuse includes comprehensive integration tests for GCS and S3 backends using 
 - Docker installed and running
 - `testcontainers-rs` dependency (included in dev-dependencies)
 
+**Note:** Tests are skipped by default. Set `RUN_CLOUD_TESTS=1` to run. In CI, tests run on Linux only (Docker service containers not supported on macOS/Windows runners).
+
 **Running GCS Emulator Tests:**
 
 ```bash
-# Requires Docker
-cargo test --features gcs --test gcs_emulator_tests
+# Requires Docker (skipped by default)
+RUN_CLOUD_TESTS=1 cargo test --features gcs --test gcs_emulator_tests
 ```
 
 Uses `fake-gcs-server` Docker image. Tests cover:
@@ -249,8 +251,8 @@ Uses `fake-gcs-server` Docker image. Tests cover:
 **Running S3 Emulator Tests:**
 
 ```bash
-# Requires Docker
-cargo test --features s3 --test s3_emulator_tests
+# Requires Docker (skipped by default)
+RUN_CLOUD_TESTS=1 cargo test --features s3 --test s3_emulator_tests
 ```
 
 Uses MinIO Docker image. Tests cover:
@@ -268,6 +270,28 @@ Uses MinIO Docker image. Tests cover:
 - Wait for container readiness (30-second timeout)
 - Clean up containers after test completion
 - Run in isolated environments (no credential leakage)
+
+### Stress Tests
+
+Stress tests validate concurrent access patterns and resource management under load. These tests are opt-in and NOT run in CI by default.
+
+```bash
+# Run stress tests (no Docker required, skipped by default)
+RUN_STRESS_TESTS=1 cargo test --test stress_tests
+
+# Configure concurrency and duration
+RUN_STRESS_TESTS=1 STRESS_TEST_CLIENTS=20 STRESS_TEST_DURATION_SECS=60 cargo test --test stress_tests
+```
+
+Tests cover:
+
+- Concurrent writers with optimistic locking
+- Read-heavy workloads (cache performance)
+- Optimistic lock resolution and retry logic
+- Cache invalidation race conditions
+- Connection cleanup and resource leak detection
+
+See [Stress Testing Guide](docs/STRESS-TESTING.md) for detailed information.
 
 ## Documentation
 
