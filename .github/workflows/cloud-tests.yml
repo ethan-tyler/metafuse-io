@@ -138,6 +138,7 @@ jobs:
           TEST_BUCKET_PREFIX: test-${{ matrix.backend.name }}-${{ github.run_id }}
         run: |
           cargo test \
+            -p metafuse-catalog-storage \
             --features ${{ matrix.backend.name }} \
             --test ${{ matrix.backend.name }}_emulator_tests \
             --verbose \
