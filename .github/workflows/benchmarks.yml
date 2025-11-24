@@ -43,7 +43,7 @@ jobs:
           alert-threshold: '120%'  # Alert if 20% performance regression (manual review)
 
       - name: Archive benchmark results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         if: always()
         with:
           name: benchmark-results
