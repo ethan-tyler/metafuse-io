@@ -7,6 +7,10 @@
 //! ```bash
 //! RUN_CLOUD_TESTS=1 cargo test --features s3 --test s3_emulator_tests
 //! ```
+//!
+//! ## CI Environment
+//! In CI, MinIO is pre-started on port 9000 by the workflow. Tests detect this
+//! and use the existing container instead of starting a new one.
 
 #[cfg(all(test, feature = "s3"))]
 mod tests {
@@ -23,6 +27,9 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         ENV_LOCK.get_or_init(|| Mutex::new(()))
     }
+
+    // CI port where MinIO is pre-started by the workflow
+    const CI_MINIO_PORT: u16 = 9000;
 
     /// Guard to optionally skip tests when cloud tests are disabled or Docker is unavailable.
     fn test_guard(name: &str) -> Option<std::sync::MutexGuard<'static, ()>> {
@@ -45,6 +52,11 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// Check if MinIO is already running (CI environment)
+    fn ci_minio_available() -> bool {
+        TcpStream::connect(("127.0.0.1", CI_MINIO_PORT)).is_ok()
+    }
+
     /// Wait for emulator to be ready
     fn wait_for_emulator_readiness(port: u16, max_attempts: u32) -> Result<(), String> {
         for attempt in 0..max_attempts {
@@ -64,30 +76,58 @@ mod tests {
         ))
     }
 
+    /// Dummy container wrapper for CI mode (no-op Drop)
+    struct CiContainerStub;
+    impl Drop for CiContainerStub {
+        fn drop(&mut self) {
+            // No cleanup needed - CI manages the container
+        }
+    }
+
+    /// Container wrapper that can be either a testcontainers container or CI stub
+    #[allow(dead_code)] // Container field is used for Drop behavior
+    enum ContainerWrapper<'a> {
+        Testcontainers(testcontainers::Container<'a, GenericImage>),
+        CiStub(CiContainerStub),
+    }
+
+    impl Drop for ContainerWrapper<'_> {
+        fn drop(&mut self) {
+            // Drop is handled by inner types
+        }
+    }
+
     /// Create a test S3 backend with MinIO emulator
+    /// In CI, uses the pre-started container on port 9000
+    /// Locally, starts a new container via testcontainers
     fn setup_s3_backend<'a>(
         docker: &'a Cli,
         bucket_name: &str,
         object_key: &str,
-    ) -> (impl Drop + 'a, S3Backend) {
-        // Start MinIO container with `server /data` command
-        // MinIO requires this command to start the S3-compatible server
-        // In testcontainers 0.15, command args are passed as a tuple (image, args)
-        let minio_image = GenericImage::new("minio/minio", "latest")
-            .with_exposed_port(9000)
-            .with_env_var("MINIO_ROOT_USER", "minioadmin")
-            .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
-            .with_wait_for(WaitFor::message_on_stdout("API:"));
+    ) -> (ContainerWrapper<'a>, S3Backend) {
+        let (container, minio_port) = if ci_minio_available() {
+            // CI environment: use pre-started container
+            println!("Using CI-provided MinIO on port {}", CI_MINIO_PORT);
+            (ContainerWrapper::CiStub(CiContainerStub), CI_MINIO_PORT)
+        } else {
+            // Local environment: start container via testcontainers
+            println!("Starting MinIO via testcontainers");
+            let minio_image = GenericImage::new("minio/minio", "latest")
+                .with_exposed_port(9000)
+                .with_env_var("MINIO_ROOT_USER", "minioadmin")
+                .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
+                .with_wait_for(WaitFor::message_on_stdout("API:"));
 
-        // Pass command arguments via tuple: (image, Vec<String>)
-        // GenericImage::Args = Vec<String>
-        let args: Vec<String> = vec!["server".to_string(), "/data".to_string()];
+            // Pass command arguments via tuple: (image, Vec<String>)
+            let args: Vec<String> = vec!["server".to_string(), "/data".to_string()];
+            let minio_container = docker.run((minio_image, args));
+            let port = minio_container.get_host_port_ipv4(9000);
 
-        let minio_container = docker.run((minio_image, args));
-        let minio_port = minio_container.get_host_port_ipv4(9000);
+            // Wait for readiness
+            wait_for_emulator_readiness(port, 30).expect("MinIO emulator failed to start");
 
-        // Wait for readiness
-        wait_for_emulator_readiness(minio_port, 30).expect("MinIO emulator failed to start");
+            (ContainerWrapper::Testcontainers(minio_container), port)
+        };
 
         // Configure AWS SDK to use MinIO
         std::env::set_var("AWS_ACCESS_KEY_ID", "minioadmin");
@@ -108,26 +148,25 @@ mod tests {
         // Create bucket (MinIO starts with no buckets)
         create_bucket_if_not_exists(minio_port, bucket_name);
 
-        (minio_container, backend)
+        (container, backend)
     }
 
-    /// Create bucket using MinIO CLI
+    /// Create bucket using MinIO mc client (faster than aws-cli)
     fn create_bucket_if_not_exists(port: u16, bucket_name: &str) {
+        // Use minio/mc which is lighter and faster than amazon/aws-cli
         let _ = Command::new("docker")
-            .args(&[
+            .args([
                 "run",
                 "--rm",
                 "--network=host",
-                "-e",
-                "AWS_ACCESS_KEY_ID=minioadmin",
-                "-e",
-                "AWS_SECRET_ACCESS_KEY=minioadmin",
-                "amazon/aws-cli",
-                "--endpoint-url",
-                &format!("http://localhost:{}", port),
-                "s3",
-                "mb",
-                &format!("s3://{}", bucket_name),
+                "--entrypoint",
+                "/bin/sh",
+                "minio/mc",
+                "-c",
+                &format!(
+                    "mc alias set local http://127.0.0.1:{} minioadmin minioadmin && mc mb local/{} 2>/dev/null || true",
+                    port, bucket_name
+                ),
             ])
             .output();
     }
