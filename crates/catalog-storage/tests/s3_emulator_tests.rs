@@ -363,7 +363,25 @@ mod tests {
             .clone()
             .unwrap();
 
-        // Simulate concurrent modification: upload to change ETag
+        // Modify the downloaded DB file so the upload will change the object bytes (and thus ETag)
+        // S3/MinIO compute ETag from content - uploading identical bytes produces identical ETag
+        {
+            let conn_mod = rusqlite::Connection::open(&download1.path).unwrap();
+            conn_mod
+                .execute(
+                    "CREATE TABLE IF NOT EXISTS _test_marker (k TEXT PRIMARY KEY, v TEXT)",
+                    [],
+                )
+                .unwrap();
+            conn_mod
+                .execute(
+                    "INSERT OR REPLACE INTO _test_marker (k, v) VALUES (?1, ?2)",
+                    rusqlite::params!["marker", "1"],
+                )
+                .unwrap();
+        }
+
+        // Upload the modified DB to simulate a concurrent writer (this changes the ETag)
         backend1.upload(&download1).await.unwrap();
 
         // Second backend with same bucket/object
@@ -465,12 +483,49 @@ mod tests {
         // Download to get initial state
         let download = backend.download().await.unwrap();
 
+        // Modify the download so upload actually changes the content
+        {
+            let conn = rusqlite::Connection::open(&download.path).unwrap();
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS _retry_marker (k TEXT PRIMARY KEY, v TEXT)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO _retry_marker (k, v) VALUES (?1, ?2)",
+                rusqlite::params!["first", "1"],
+            )
+            .unwrap();
+        }
+
         // First upload should succeed
         let result = backend.upload(&download).await;
         assert!(result.is_ok(), "First upload should succeed");
 
-        // Second upload with same (now stale) download should trigger retries
-        // After 3 retries with exponential backoff, it should fail
+        // Simulate an external concurrent modification to make `download` stale:
+        // Download current remote, modify it, upload it (this changes ETag on server)
+        let external = backend.download().await.unwrap();
+        {
+            let conn_ext = rusqlite::Connection::open(&external.path).unwrap();
+            conn_ext
+                .execute(
+                    "CREATE TABLE IF NOT EXISTS _ext_marker (k TEXT PRIMARY KEY, v TEXT)",
+                    [],
+                )
+                .unwrap();
+            conn_ext
+                .execute(
+                    "INSERT OR REPLACE INTO _ext_marker (k, v) VALUES (?1, ?2)",
+                    rusqlite::params!["ext", "1"],
+                )
+                .unwrap();
+        }
+        backend
+            .upload(&external)
+            .await
+            .expect("external upload should succeed");
+
+        // Now attempt the stale upload (original `download`) which should trigger retries and fail
         let result = backend.upload(&download).await;
         assert!(
             result.is_err(),
@@ -499,17 +554,26 @@ mod tests {
         // Initialize catalog
         backend.initialize().await.unwrap();
 
-        // Insert fake dataset to verify preservation
-        let conn = backend.get_connection().await.unwrap();
-        conn.execute(
-            "INSERT INTO datasets (name, path, format, created_at, last_updated) VALUES (?, ?, ?, datetime('now'), datetime('now'))",
-            rusqlite::params!["test_dataset", "s3://bucket/data.parquet", "parquet"],
-        )
-        .unwrap();
-
-        // Download should include the inserted data
+        // Download the current remote DB, modify it locally, then upload
+        // Note: get_connection() returns a local temp file - changes don't auto-sync to S3
         let download = backend.download().await.unwrap();
-        let conn2 = rusqlite::Connection::open(&download.path).unwrap();
+
+        // Modify the downloaded DB to insert the fake dataset
+        {
+            let conn = rusqlite::Connection::open(&download.path).unwrap();
+            conn.execute(
+                "INSERT INTO datasets (name, path, format, created_at, last_updated) VALUES (?, ?, ?, datetime('now'), datetime('now'))",
+                rusqlite::params!["test_dataset", "s3://bucket/data.parquet", "parquet"],
+            )
+            .unwrap();
+        }
+
+        // Upload the modified DB so the remote object contains the inserted row
+        backend.upload(&download).await.unwrap();
+
+        // Now download again and verify the inserted data is preserved
+        let download2 = backend.download().await.unwrap();
+        let conn2 = rusqlite::Connection::open(&download2.path).unwrap();
 
         let mut stmt = conn2.prepare("SELECT name FROM datasets").unwrap();
         let names: Vec<String> = stmt
