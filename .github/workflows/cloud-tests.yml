@@ -34,8 +34,11 @@ jobs:
       fail-fast: false
       matrix:
         backend:
+          # GCS tests are currently ignored due to XML API incompatibility between
+          # object_store crate and fake-gcs-server. Running them validates compilation.
+          # See: https://github.com/fsouza/fake-gcs-server/issues/331
           - name: gcs
-            emulator: fake-gcs-server
+            emulator: tustvold/fake-gcs-server
             port: 4443
           - name: s3
             emulator: minio
@@ -74,12 +77,14 @@ jobs:
       - name: Start GCS emulator
         if: steps.docker_check.outputs.skip != 'true' && matrix.backend.name == 'gcs'
         run: |
+          # Using tustvold/fake-gcs-server which has better object_store compatibility
+          # Note: GCS tests are currently #[ignore]'d due to XML API incompatibility
           docker run -d \
             --name fake-gcs-server-${{ github.run_id }} \
             --rm \
             -p 4443:4443 \
-            fsouza/fake-gcs-server:latest \
-            -scheme http -port 4443
+            tustvold/fake-gcs-server:latest \
+            -scheme http -port 4443 -backend memory -public-host localhost:4443
 
           echo "Waiting for GCS emulator to be ready..."
           for i in {1..30}; do
@@ -93,6 +98,11 @@ jobs:
             fi
             sleep 1
           done
+
+          # Create test bucket via JSON API
+          curl -s -X POST --data-binary '{"name":"test-bucket"}' \
+            -H "Content-Type: application/json" \
+            "http://localhost:4443/storage/v1/b" || true
 
       - name: Start S3 emulator (MinIO)
         if: steps.docker_check.outputs.skip != 'true' && matrix.backend.name == 's3'
