@@ -91,6 +91,7 @@ metafuse-catalog-emitter = { path = "crates/catalog-emitter" }
 metafuse-catalog-storage = { path = "crates/catalog-storage" }
 datafusion.workspace = true
 tokio.workspace = true
+chrono.workspace = true
 
 # Features
 [features]
@@ -111,3 +112,8 @@ name = "emitter_benchmarks"
 path = "benches/emitter_benchmarks.rs"
 harness = false
 required-features = ["bench"]
+
+[[bench]]
+name = "cloud_backend_benchmarks"
+path = "benches/cloud_backend_benchmarks.rs"
+harness = false

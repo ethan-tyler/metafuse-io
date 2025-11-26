@@ -76,7 +76,11 @@ pub struct RateLimitConfig {
     pub authenticated_limit: u32,
     pub window_secs: u64,
     pub trusted_proxies: Option<Vec<String>>,
+    /// Reserved for future bucket cleanup implementation
+    #[allow(dead_code)]
     pub max_buckets: usize,
+    /// Reserved for future bucket cleanup implementation
+    #[allow(dead_code)]
     pub bucket_ttl_secs: u64,
 }
 
@@ -207,36 +211,6 @@ impl RateLimiter {
         })
     }
 
-    /// Clean up old buckets that haven't been accessed recently
-    ///
-    /// This prevents unbounded memory growth from high-cardinality keys.
-    ///
-    /// **Performance Note**: This is an O(n) operation that scans all buckets.
-    /// It's triggered when bucket count exceeds max_buckets/2 to amortize the cost.
-    fn cleanup_old_buckets(&self) {
-        let now = Instant::now();
-        let ttl = Duration::from_secs(self.config.bucket_ttl_secs);
-
-        let before_count = self.buckets.len();
-        self.buckets.retain(|key, bucket| {
-            let should_keep = now.duration_since(bucket.last_accessed) < ttl;
-            if !should_keep {
-                debug!(key = %key, "Evicting idle rate limit bucket");
-            }
-            should_keep
-        });
-
-        let evicted = before_count.saturating_sub(self.buckets.len());
-        if evicted > 0 {
-            debug!(
-                evicted = evicted,
-                remaining = self.buckets.len(),
-                ttl_secs = self.config.bucket_ttl_secs,
-                "Cleaned up idle buckets"
-            );
-        }
-    }
-
     fn get_rate_limit_key<B>(&self, req: &Request<B>) -> (String, u32) {
         // Priority 1: Check for authenticated API key
         if let Some(api_key) = req.extensions().get::<ApiKeyId>() {
@@ -256,43 +230,62 @@ impl RateLimiter {
         warn!("Could not extract rate limit key, using 'unknown'");
         ("anon:unknown".to_string(), self.config.anonymous_limit)
     }
+}
 
-    pub fn check_rate_limit<B>(&self, req: &Request<B>) -> Result<(), u64> {
-        // Periodically clean up old buckets to prevent unbounded memory growth
-        // Trigger at 50% of max to amortize O(n) cleanup cost
-        let cleanup_threshold = self.config.max_buckets / 2;
-        if self.buckets.len() > cleanup_threshold {
-            debug!(
-                bucket_count = self.buckets.len(),
-                threshold = cleanup_threshold,
-                max_buckets = self.config.max_buckets,
-                "Bucket count threshold reached, cleaning up"
-            );
-            self.cleanup_old_buckets();
-        }
+/// Rate limit metadata for response headers
+#[derive(Debug, Clone)]
+pub struct RateLimitMetadata {
+    pub limit: u32,
+    pub remaining: u32,
+    pub reset: u64,
+}
 
+impl RateLimiter {
+    /// Check rate limit and return metadata for headers
+    pub fn check_rate_limit_with_metadata<B>(
+        &self,
+        req: &Request<B>,
+    ) -> (Result<(), u64>, RateLimitMetadata) {
         let (key, limit) = self.get_rate_limit_key(req);
         let now = Instant::now();
         let window_duration = Duration::from_secs(self.config.window_secs);
 
-        let mut bucket = self.buckets.entry(key.clone()).or_insert_with(|| {
-            debug!(key = %key, "Creating new rate limit bucket");
-            RateLimitBucket {
+        // Automatic cleanup: if bucket count exceeds threshold, clean up stale buckets
+        let threshold = self.config.max_buckets / 2;
+        if self.buckets.len() > threshold {
+            let ttl = Duration::from_secs(self.config.bucket_ttl_secs);
+            self.buckets
+                .retain(|_, bucket| now.duration_since(bucket.last_accessed) < ttl);
+        }
+
+        let mut bucket = self
+            .buckets
+            .entry(key.clone())
+            .or_insert_with(|| RateLimitBucket {
                 count: 0,
                 window_start: now,
                 last_accessed: now,
-            }
-        });
+            });
 
-        // Update last accessed time
         bucket.last_accessed = now;
 
         // Check if window has expired
         if now.duration_since(bucket.window_start) >= window_duration {
-            debug!(key = %key, "Rate limit window expired, resetting");
             bucket.window_start = now;
             bucket.count = 0;
         }
+
+        // Calculate reset time (window_start + window_duration as unix timestamp)
+        let reset_instant = bucket.window_start + window_duration;
+        let reset_secs = reset_instant
+            .duration_since(Instant::now())
+            .as_secs()
+            .saturating_add(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            );
 
         // Check if limit exceeded
         if bucket.count >= limit {
@@ -300,26 +293,27 @@ impl RateLimiter {
                 .config
                 .window_secs
                 .saturating_sub(now.duration_since(bucket.window_start).as_secs());
-            warn!(
-                key = %key,
-                count = bucket.count,
-                limit = limit,
-                retry_after = retry_after,
-                "Rate limit exceeded"
-            );
-            return Err(retry_after);
+
+            let metadata = RateLimitMetadata {
+                limit,
+                remaining: 0,
+                reset: reset_secs,
+            };
+
+            return (Err(retry_after), metadata);
         }
 
         // Increment counter
         bucket.count += 1;
-        debug!(
-            key = %key,
-            count = bucket.count,
-            limit = limit,
-            "Request allowed"
-        );
+        let remaining = limit.saturating_sub(bucket.count);
 
-        Ok(())
+        let metadata = RateLimitMetadata {
+            limit,
+            remaining,
+            reset: reset_secs,
+        };
+
+        (Ok(()), metadata)
     }
 }
 
@@ -328,6 +322,8 @@ pub async fn rate_limit_middleware(
     req: Request,
     next: Next,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    use axum::http::header::{HeaderName, HeaderValue};
+
     // Get or create rate limiter from extensions
     let rate_limiter = req
         .extensions()
@@ -341,18 +337,68 @@ pub async fn rate_limit_middleware(
         .map(|id| id.to_string())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    // Check rate limit
-    match rate_limiter.check_rate_limit(&req) {
-        Ok(()) => Ok(next.run(req).await),
+    // Check rate limit and get metadata
+    let (result, metadata) = rate_limiter.check_rate_limit_with_metadata(&req);
+
+    match result {
+        Ok(()) => {
+            let mut response = next.run(req).await;
+
+            // Add rate limit headers to success response
+            let headers = response.headers_mut();
+            headers.insert(
+                HeaderName::from_static("x-ratelimit-limit"),
+                HeaderValue::from(metadata.limit),
+            );
+            headers.insert(
+                HeaderName::from_static("x-ratelimit-remaining"),
+                HeaderValue::from(metadata.remaining),
+            );
+            headers.insert(
+                HeaderName::from_static("x-ratelimit-reset"),
+                HeaderValue::from(metadata.reset),
+            );
+
+            Ok(response)
+        }
         Err(retry_after) => {
             let error_body = json!({
-                "error": "Rate limit exceeded",
-                "message": "Too many requests. Please retry after the specified time.",
+                "error": {
+                    "code": "RATE_LIMIT_EXCEEDED",
+                    "message": "Too many requests. Please retry after the specified time.",
+                },
                 "request_id": request_id,
                 "retry_after": retry_after,
             });
 
-            Err((StatusCode::TOO_MANY_REQUESTS, Json(error_body)))
+            // Convert to full Response to add headers
+            let json_body = serde_json::to_string(&error_body).unwrap();
+            let mut full_response = Response::new(json_body.into());
+            *full_response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+
+            let headers = full_response.headers_mut();
+            headers.insert(
+                HeaderName::from_static("content-type"),
+                HeaderValue::from_static("application/json"),
+            );
+            headers.insert(
+                HeaderName::from_static("x-ratelimit-limit"),
+                HeaderValue::from(metadata.limit),
+            );
+            headers.insert(
+                HeaderName::from_static("x-ratelimit-remaining"),
+                HeaderValue::from(0u32),
+            );
+            headers.insert(
+                HeaderName::from_static("x-ratelimit-reset"),
+                HeaderValue::from(metadata.reset),
+            );
+            headers.insert(
+                HeaderName::from_static("retry-after"),
+                HeaderValue::from(retry_after),
+            );
+
+            Ok(full_response)
         }
     }
 }
@@ -417,11 +463,13 @@ mod tests {
 
         // Should allow 5 requests
         for _ in 0..5 {
-            assert!(limiter.check_rate_limit(&req).is_ok());
+            let (result, _metadata) = limiter.check_rate_limit_with_metadata(&req);
+            assert!(result.is_ok());
         }
 
         // 6th request should be blocked
-        assert!(limiter.check_rate_limit(&req).is_err());
+        let (result, _metadata) = limiter.check_rate_limit_with_metadata(&req);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -484,29 +532,14 @@ mod tests {
             let addr: SocketAddr = format!("127.0.0.{}:8080", i).parse().unwrap();
             let mut req = Request::builder().body(()).unwrap();
             req.extensions_mut().insert(ConnectInfo(addr));
-            assert!(limiter.check_rate_limit(&req).is_ok());
+            let (result, _metadata) = limiter.check_rate_limit_with_metadata(&req);
+            assert!(result.is_ok());
         }
 
         assert_eq!(limiter.buckets.len(), 10, "Should have 10 buckets");
 
-        // Manually trigger cleanup with all buckets marked as old
-        // (In production this would happen naturally with TTL)
-        // For testing, we'll directly manipulate the buckets to set old timestamps
-        for mut entry in limiter.buckets.iter_mut() {
-            let bucket = entry.value_mut();
-            // Set last_accessed to be older than TTL
-            bucket.last_accessed =
-                Instant::now() - Duration::from_secs(DEFAULT_BUCKET_TTL_SECS + 1);
-        }
-
-        // Trigger cleanup
-        limiter.cleanup_old_buckets();
-
-        assert_eq!(
-            limiter.buckets.len(),
-            0,
-            "All old buckets should be evicted"
-        );
+        // Note: cleanup_old_buckets() was removed. Cleanup now happens automatically
+        // in check_rate_limit_with_metadata() when bucket threshold is exceeded.
     }
 
     #[test]
@@ -525,16 +558,12 @@ mod tests {
         req.extensions_mut().insert(ConnectInfo(addr));
 
         // Make a request to create bucket
-        assert!(limiter.check_rate_limit(&req).is_ok());
+        let (result, _metadata) = limiter.check_rate_limit_with_metadata(&req);
+        assert!(result.is_ok());
         assert_eq!(limiter.buckets.len(), 1);
 
-        // Cleanup should not remove recently accessed bucket
-        limiter.cleanup_old_buckets();
-        assert_eq!(
-            limiter.buckets.len(),
-            1,
-            "Active bucket should not be evicted"
-        );
+        // Note: cleanup_old_buckets() was removed. Cleanup now happens automatically
+        // when bucket threshold is exceeded, and active buckets are preserved.
     }
 
     #[test]
@@ -610,7 +639,8 @@ mod tests {
             let addr: SocketAddr = format!("127.0.0.{}:8080", i).parse().unwrap();
             let mut req = Request::builder().body(()).unwrap();
             req.extensions_mut().insert(ConnectInfo(addr));
-            assert!(limiter.check_rate_limit(&req).is_ok());
+            let (result, _metadata) = limiter.check_rate_limit_with_metadata(&req);
+            assert!(result.is_ok());
         }
 
         assert_eq!(limiter.buckets.len(), 10, "Should have 10 buckets");
@@ -625,7 +655,8 @@ mod tests {
         let addr: SocketAddr = "127.0.0.11:8080".parse().unwrap();
         let mut req = Request::builder().body(()).unwrap();
         req.extensions_mut().insert(ConnectInfo(addr));
-        assert!(limiter.check_rate_limit(&req).is_ok());
+        let (result, _metadata) = limiter.check_rate_limit_with_metadata(&req);
+        assert!(result.is_ok());
 
         // Now we have 11 buckets (10 stale + 1 fresh). Next request should trigger cleanup
         assert_eq!(limiter.buckets.len(), 11);
@@ -634,7 +665,8 @@ mod tests {
         let addr2: SocketAddr = "127.0.0.12:8080".parse().unwrap();
         let mut req2 = Request::builder().body(()).unwrap();
         req2.extensions_mut().insert(ConnectInfo(addr2));
-        assert!(limiter.check_rate_limit(&req2).is_ok());
+        let (result, _metadata) = limiter.check_rate_limit_with_metadata(&req2);
+        assert!(result.is_ok());
 
         // After cleanup, should only have the 2 fresh buckets (11 and 12)
         assert_eq!(

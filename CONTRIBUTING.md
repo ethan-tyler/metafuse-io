@@ -33,7 +33,16 @@ This project adheres to the [Contributor Covenant Code of Conduct](CODE_OF_CONDU
    cargo test --doc  # Run documentation tests
    ```
 
-4. **Run examples**
+4. **Run cloud tests** (optional, requires Docker)
+   ```bash
+   # Cloud emulator tests (requires Docker)
+   RUN_CLOUD_TESTS=1 cargo test --features gcs --test gcs_emulator_tests
+   RUN_CLOUD_TESTS=1 cargo test --features s3 --test s3_emulator_tests
+   ```
+
+   See [Cloud Emulator Testing](docs/cloud-emulator-tests.md) for details.
+
+5. **Run examples**
    ```bash
    ./run_examples.sh
    # Or individually:
@@ -41,7 +50,7 @@ This project adheres to the [Contributor Covenant Code of Conduct](CODE_OF_CONDU
    cargo run --example lineage_tracking
    ```
 
-5. **Check code quality**
+6. **Check code quality**
    ```bash
    cargo fmt --all -- --check    # Format check
    cargo clippy --workspace --all-features -- -D warnings  # Linting

@@ -35,7 +35,8 @@ MetaFuse v0.5.0 focuses on production hardening following the v0.4.x async migra
 
 - **Removed deprecated sync adapter** - Clean async-only API surface
 - **Enhanced CI validation** - Cloud emulator tests for GCS/S3 backends
-- **Concurrency stress testing** - Opt-in tests for optimistic locking
+- **Security integration tests** - Rate limiting and API key authentication validation
+- **Cloud backend benchmarks** - Performance benchmarks for GCS/S3 (compile-only in CI)
 - **Improved documentation** - Updated guides and examples
 
 **No new features** - this is a cleanup release to remove technical debt.
@@ -348,8 +349,8 @@ cargo test --features "rate-limiting,api-keys"
 # Cloud emulator tests (requires Docker)
 RUN_CLOUD_TESTS=1 cargo test --features cloud
 
-# Stress tests (optional)
-RUN_STRESS_TESTS=1 cargo test
+# Security integration tests
+cargo test --features rate-limiting,api-keys --test security_integration_tests
 ```
 
 ### Manual Testing
