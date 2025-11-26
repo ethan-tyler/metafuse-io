@@ -1,0 +1,177 @@
+name: Cloud Emulator Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      run_cloud_tests:
+        description: 'Force run cloud tests'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+  RUN_CLOUD_TESTS: ${{ github.event.inputs.run_cloud_tests == 'true' && '1' || '0' }}
+
+jobs:
+  cloud-emulator-tests:
+    name: Cloud Backend Tests (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+
+    # Skip on external forks (Docker service containers not available)
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      !github.event.pull_request.head.repo.fork
+
+    strategy:
+      fail-fast: false
+      matrix:
+        backend:
+          # GCS tests are currently ignored due to XML API incompatibility between
+          # object_store crate and fake-gcs-server. Running them validates compilation.
+          # See: https://github.com/fsouza/fake-gcs-server/issues/331
+          - name: gcs
+            emulator: tustvold/fake-gcs-server
+            port: 4443
+          - name: s3
+            emulator: minio
+            port: 9000
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Check Docker availability
+        id: docker_check
+        run: |
+          if ! docker info > /dev/null 2>&1; then
+            echo "Docker unavailable, skipping cloud tests"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "Docker is available"
+          echo "skip=false" >> $GITHUB_OUTPUT
+
+      - name: Skip message
+        if: steps.docker_check.outputs.skip == 'true'
+        run: |
+          echo "::notice::Cloud tests skipped: Docker not available"
+
+      - name: Install Rust toolchain
+        if: steps.docker_check.outputs.skip != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        if: steps.docker_check.outputs.skip != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: cloud-${{ matrix.backend.name }}-linux
+
+      - name: Start GCS emulator
+        if: steps.docker_check.outputs.skip != 'true' && matrix.backend.name == 'gcs'
+        run: |
+          # Using tustvold/fake-gcs-server which has better object_store compatibility
+          # Note: GCS tests are currently #[ignore]'d due to XML API incompatibility
+          docker run -d \
+            --name fake-gcs-server-${{ github.run_id }} \
+            --rm \
+            -p 4443:4443 \
+            tustvold/fake-gcs-server:latest \
+            -scheme http -port 4443 -backend memory -public-host localhost:4443
+
+          echo "Waiting for GCS emulator to be ready..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 4443 2>/dev/null; then
+              echo "GCS emulator is ready"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "GCS emulator failed to start"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          # Create test bucket via JSON API
+          curl -s -X POST --data-binary '{"name":"test-bucket"}' \
+            -H "Content-Type: application/json" \
+            "http://localhost:4443/storage/v1/b" || true
+
+      - name: Start S3 emulator (MinIO)
+        if: steps.docker_check.outputs.skip != 'true' && matrix.backend.name == 's3'
+        run: |
+          docker run -d \
+            --name minio-${{ github.run_id }} \
+            --rm \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest \
+            server /data
+
+          echo "Waiting for MinIO to be ready..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 9000 2>/dev/null; then
+              echo "MinIO is ready"
+              sleep 2
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "MinIO failed to start"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          # Create test bucket using mc (MinIO client)
+          # Note: Tests use 'test-bucket' as the bucket name
+          docker run --rm \
+            --network host \
+            --entrypoint /bin/sh \
+            minio/mc:latest \
+            -c "mc alias set local http://127.0.0.1:9000 minioadmin minioadmin && mc mb local/test-bucket || true"
+
+      - name: Run cloud tests (${{ matrix.backend.name }})
+        if: steps.docker_check.outputs.skip != 'true'
+        timeout-minutes: 20
+        env:
+          RUN_CLOUD_TESTS: 1
+          RUST_TEST_THREADS: 1
+          METAFUSE_CACHE_TTL_SECS: 0
+          # Unique bucket prefix for this run
+          TEST_BUCKET_PREFIX: test-${{ matrix.backend.name }}-${{ github.run_id }}
+        run: |
+          cargo test \
+            -p metafuse-catalog-storage \
+            --features ${{ matrix.backend.name }} \
+            --test ${{ matrix.backend.name }}_emulator_tests \
+            --verbose \
+            -- --nocapture
+
+      - name: Upload test results
+        if: always() && steps.docker_check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-test-results-${{ matrix.backend.name }}
+          path: |
+            target/debug/**/*.profraw
+            *.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Cleanup containers
+        if: always()
+        run: |
+          docker ps -a | grep "fake-gcs-server-${{ github.run_id }}" | awk '{print $1}' | xargs -r docker rm -f || true
+          docker ps -a | grep "minio-${{ github.run_id }}" | awk '{print $1}' | xargs -r docker rm -f || true
+
+          # Cleanup any orphaned containers from previous runs
+          docker ps -a | grep fake-gcs-server | grep -v "${{ github.run_id }}" | awk '{print $1}' | xargs -r docker rm -f || true
+          docker ps -a | grep minio | grep -v "${{ github.run_id }}" | awk '{print $1}' | xargs -r docker rm -f || true

@@ -29,12 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Gated behind `RUN_CLOUD_TESTS=1` environment variable
   - Only runs on main repository (not forks)
   - Serialized execution to prevent port conflicts
-- Concurrency stress test suite (opt-in via `RUN_STRESS_TESTS=1`)
-  - Multi-writer conflict scenarios
-  - Read-heavy load testing
-  - Cache consistency validation
-  - Retry exhaustion testing
+- Cloud backend benchmarks (compile-only in PR CI)
+  - GCS and S3 upload/download performance benchmarks
+  - Cache hit vs miss performance testing
+- Security integration tests for rate limiting and API key authentication
 - Comprehensive v0.5.0 migration guide
+
+**Note**: Stress tests were initially planned but removed due to API incompatibility with v0.4 architecture. Performance and load testing will be addressed in a future release with proper integration using Emitter and CatalogBackend APIs.
 
 #### Improved
 

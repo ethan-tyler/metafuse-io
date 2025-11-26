@@ -230,11 +230,13 @@ MetaFuse includes comprehensive integration tests for GCS and S3 backends using 
 - Docker installed and running
 - `testcontainers-rs` dependency (included in dev-dependencies)
 
+**Note:** Tests are skipped by default. Set `RUN_CLOUD_TESTS=1` to run. In CI, tests run on Linux only (Docker service containers not supported on macOS/Windows runners).
+
 **Running GCS Emulator Tests:**
 
 ```bash
-# Requires Docker
-cargo test --features gcs --test gcs_emulator_tests
+# Requires Docker (skipped by default)
+RUN_CLOUD_TESTS=1 cargo test --features gcs --test gcs_emulator_tests
 ```
 
 Uses `fake-gcs-server` Docker image. Tests cover:
@@ -249,8 +251,8 @@ Uses `fake-gcs-server` Docker image. Tests cover:
 **Running S3 Emulator Tests:**
 
 ```bash
-# Requires Docker
-cargo test --features s3 --test s3_emulator_tests
+# Requires Docker (skipped by default)
+RUN_CLOUD_TESTS=1 cargo test --features s3 --test s3_emulator_tests
 ```
 
 Uses MinIO Docker image. Tests cover:

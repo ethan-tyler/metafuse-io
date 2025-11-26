@@ -414,16 +414,48 @@ impl GcsBackend {
         let bucket = bucket.into();
         let object_path = object.into();
 
-        // Build GCS client with Application Default Credentials
-        let store = GoogleCloudStorageBuilder::from_env()
-            .with_bucket_name(&bucket)
-            .build()
-            .map_err(|e| {
-                CatalogError::Other(format!(
-                    "Failed to create GCS client. Check GOOGLE_APPLICATION_CREDENTIALS: {}",
-                    e
-                ))
-            })?;
+        // Check if using emulator (skip authentication)
+        let emulator_host = std::env::var("STORAGE_EMULATOR_HOST").ok();
+
+        // Build GCS client
+        let store = if let Some(ref host) = emulator_host {
+            // Emulator mode: use a fake service account key with gcs_base_url pointing to emulator
+            // and disable_oauth=true to skip authentication. object_store supports these custom
+            // fields in the service account JSON to configure the endpoint.
+            tracing::debug!(emulator_host = %host, "Using GCS emulator with custom base URL");
+
+            let fake_key = format!(
+                r#"{{
+                    "gcs_base_url": "{}",
+                    "disable_oauth": true,
+                    "client_email": "test@test-project.iam.gserviceaccount.com",
+                    "private_key_id": "1",
+                    "private_key": "not-used",
+                    "type": "service_account",
+                    "project_id": "test-project"
+                }}"#,
+                host
+            );
+
+            GoogleCloudStorageBuilder::new()
+                .with_bucket_name(&bucket)
+                .with_service_account_key(&fake_key)
+                .build()
+                .map_err(|e| {
+                    CatalogError::Other(format!("Failed to create GCS client for emulator: {}", e))
+                })?
+        } else {
+            // Production mode: use Application Default Credentials
+            GoogleCloudStorageBuilder::from_env()
+                .with_bucket_name(&bucket)
+                .build()
+                .map_err(|e| {
+                    CatalogError::Other(format!(
+                        "Failed to create GCS client. Check GOOGLE_APPLICATION_CREDENTIALS: {}",
+                        e
+                    ))
+                })?
+        };
 
         // Initialize cache (optional based on env config)
         let cache = CatalogCache::from_env().unwrap_or_else(|e| {
@@ -502,7 +534,10 @@ impl CatalogBackend for GcsBackend {
             .map_err(|e| CatalogError::Other(format!("Task join error: {}", e)))??;
 
             // Persist temp file (keep it alive for subsequent operations)
-            let temp_path = temp_file.into_temp_path().to_path_buf();
+            let temp_path = temp_file
+                .into_temp_path()
+                .keep()
+                .map_err(|e| CatalogError::Other(format!("Failed to persist temp file: {}", e)))?;
 
             let download = CatalogDownload {
                 path: temp_path,
@@ -884,7 +919,10 @@ impl CatalogBackend for S3Backend {
             .map_err(|e| CatalogError::Other(format!("Task join error: {}", e)))??;
 
             // Persist temp file (keep it alive for subsequent operations)
-            let temp_path = temp_file.into_temp_path().to_path_buf();
+            let temp_path = temp_file
+                .into_temp_path()
+                .keep()
+                .map_err(|e| CatalogError::Other(format!("Failed to persist temp file: {}", e)))?;
 
             let download = CatalogDownload {
                 path: temp_path,

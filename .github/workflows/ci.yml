@@ -60,13 +60,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
+      - name: Sanitize feature string for cache key
+        id: sanitize
+        run: echo "features_sanitized=$(echo '${{ matrix.features }}' | tr ',' '-')" >> $GITHUB_OUTPUT
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          key: security-${{ matrix.features }}
+          key: security-${{ steps.sanitize.outputs.features_sanitized }}
 
       - name: Build with features (${{ matrix.features }})
         run: cargo build -p metafuse-catalog-api --features "${{ matrix.features }}" --verbose

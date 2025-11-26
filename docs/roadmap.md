@@ -266,14 +266,16 @@ Only validated API keys get identity attached, ensuring attackers cannot bypass 
     - S3: MinIO Docker container
     - Environment variable: `RUN_CLOUD_TESTS=1`
     - Fork detection and Docker availability checks
-  - Concurrency stress tests (opt-in via `RUN_STRESS_TESTS=1`)
-    - Multi-writer conflict scenarios
-    - Read-heavy load testing
-    - Cache consistency validation
+  - Cloud backend benchmarks (compile-only in PR CI)
+    - GCS and S3 upload/download performance benchmarks
+    - Cache hit vs miss performance testing
+  - Security integration tests for rate limiting and API key authentication
   - CI safety improvements
     - Timeout limits for all jobs
     - Graceful failure on Docker unavailability
     - Non-blocking emulator tests initially
+
+  **Note**: Concurrency stress tests were deferred to v0.5.1+ due to API incompatibility with current architecture
 
 ### Future (v0.5.1+)
 
