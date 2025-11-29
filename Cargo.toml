@@ -1,10 +1,12 @@
 [workspace]
 members = [
     "crates/catalog-core",
+    "crates/catalog-delta",
     "crates/catalog-emitter",
     "crates/catalog-storage",
     "crates/catalog-api",
     "crates/catalog-cli",
+    "crates/catalog-client",
 ]
 
 resolver = "2"
@@ -22,11 +24,11 @@ license = "Apache-2.0"
 authors = ["Ethan Urbanski <ethan@urbanskitech.com>"]
 repository = "https://github.com/ethan-tyler/MetaFuse"
 description = "MetaFuse: a lightweight, serverless data catalog for DataFusion and lakehouse pipelines."
-version = "0.4.2"
+version = "0.5.0"
 
 [workspace.lints.clippy]
 await_holding_lock = "warn"
-await_holding_refcell = "warn"
+await_holding_refcell_ref = "warn"
 large_futures = "warn"
 
 [workspace.lints.rust]
@@ -37,6 +39,11 @@ unsafe_code = "forbid"
 serde = { version = "1", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
+
+# Delta Lake integration
+deltalake = { version = "0.29" }
+lru = "0.12"
+regex = "1"
 
 # Metrics (optional)
 prometheus = "0.13"
@@ -53,11 +60,11 @@ hex = "0.4"
 # Database
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
 
-# DataFusion
-datafusion = "51"
+# DataFusion (pinned to 50.x for deltalake 0.29 compatibility)
+datafusion = "50"
 
 # API/Server
-axum = "0.8"
+axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }

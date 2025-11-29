@@ -1,0 +1,54 @@
+[package]
+name = "metafuse-catalog-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "HTTP client SDK for MetaFuse catalog with optional DataFusion integration"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+datafusion = ["dep:datafusion", "dep:async-trait", "dep:deltalake"]
+
+[dependencies]
+# HTTP client with retry
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest-middleware = "0.4"
+reqwest-retry = "0.7"
+
+# Async runtime
+tokio = { workspace = true, features = ["sync", "time"] }
+async-trait = { version = "0.1", optional = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+
+# Error handling & logging
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Caching (following catalog-delta pattern)
+lru = { workspace = true }
+
+# URL handling
+url = "2"
+urlencoding = "2"
+
+# HTTP date parsing (RFC 7231)
+httpdate = "1"
+
+# DataFusion integration (optional)
+# With DataFusion 50.x, deltalake 0.29 TableProvider is fully compatible
+datafusion = { workspace = true, optional = true }
+deltalake = { workspace = true, optional = true, features = ["datafusion"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6"
+tempfile = { workspace = true }
