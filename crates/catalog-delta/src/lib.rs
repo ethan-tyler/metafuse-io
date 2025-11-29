@@ -331,8 +331,10 @@ impl DeltaReader {
         }
 
         // Check if it's an absolute path
+        // Handle Unix-style paths (starting with /) on all platforms,
+        // plus platform-native absolute paths (e.g., C:\ on Windows)
         let path = Path::new(location);
-        if path.is_absolute() {
+        if location.starts_with('/') || path.is_absolute() {
             return Ok(format!("file://{}", location));
         }
 
