@@ -673,6 +673,7 @@ mod tests {
         assert!(config.validate().is_ok());
     }
 
+    #[cfg(feature = "tempfile")]
     #[test]
     fn test_tenant_backend_accessors() {
         use metafuse_catalog_storage::LocalSqliteBackend;
@@ -695,6 +696,7 @@ mod tests {
         assert!(resources.factory().is_none());
     }
 
+    #[cfg(feature = "tempfile")]
     #[tokio::test]
     async fn test_multi_tenant_resources_enabled() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -711,6 +713,7 @@ mod tests {
         assert!(resources.factory().is_some());
     }
 
+    #[cfg(feature = "tempfile")]
     #[test]
     fn test_resolve_backend_with_tenant() {
         use metafuse_catalog_storage::LocalSqliteBackend;
@@ -731,6 +734,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&resolved, &default_backend));
     }
 
+    #[cfg(feature = "tempfile")]
     #[test]
     fn test_resolve_backend_without_tenant() {
         use metafuse_catalog_storage::LocalSqliteBackend;
@@ -745,6 +749,7 @@ mod tests {
         assert!(Arc::ptr_eq(&resolved, &default_backend));
     }
 
+    #[cfg(feature = "tempfile")]
     #[tokio::test]
     async fn test_cache_invalidation() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -779,6 +784,7 @@ mod tests {
         assert!(!resources.invalidate_tenant_cache("non-existent"));
     }
 
+    #[cfg(feature = "tempfile")]
     #[tokio::test]
     async fn test_clear_all_caches() {
         let temp = tempfile::TempDir::new().unwrap();

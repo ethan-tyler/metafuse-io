@@ -32,9 +32,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::{tempdir, TempDir};
 
-use crate::control_plane::{AuditContext, ControlPlane, CreateTenantRequest, Tenant, TenantRole};
+use crate::control_plane::{AuditContext, ControlPlane, CreateTenantRequest, Tenant};
 use metafuse_catalog_core::{CatalogError, Result};
 
+#[cfg(feature = "api-keys")]
+use crate::control_plane::TenantRole;
 #[cfg(feature = "api-keys")]
 use crate::tenant_resolver::{ResolvedTenant, TenantSource};
 #[cfg(feature = "api-keys")]

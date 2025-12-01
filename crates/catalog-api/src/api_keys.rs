@@ -1,3 +1,7 @@
+// Allow dead_code for public API items that are used by library consumers
+// but not within the crate itself (middleware building blocks, test utilities)
+#![allow(dead_code)]
+
 //! API Key Authentication Module
 //!
 //! Provides secure API key generation, validation, and management with bcrypt

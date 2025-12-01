@@ -11,6 +11,9 @@
 //! These tests verify the core control plane functionality that manages
 //! tenant provisioning and lifecycle in a multi-tenant deployment.
 
+// This test module requires the test-utils feature
+#![cfg(feature = "test-utils")]
+
 use metafuse_catalog_api::control_plane::{AuditContext, CreateTenantRequest, UpdateTenantRequest};
 use metafuse_catalog_api::test_utils::{
     test_audit_context, test_audit_context_with_actor, TestControlPlane, TestTenantBuilder,

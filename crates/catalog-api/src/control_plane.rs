@@ -742,6 +742,7 @@ impl ControlPlane {
 
         // Serialize request for audit before move
         let req_json = serde_json::to_string(&req).unwrap_or_default();
+        #[cfg(feature = "api-keys")]
         let tier_updated = req.tier.is_some();
 
         let tenant = tokio::task::spawn_blocking(move || {
@@ -1618,6 +1619,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tempfile")]
     #[tokio::test]
     async fn test_tenant_lifecycle() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -2051,6 +2053,7 @@ mod tests {
     // Duplicate Constraint Tests
     // ==========================================================================
 
+    #[cfg(feature = "tempfile")]
     #[tokio::test]
     async fn test_duplicate_tenant_id_rejected() {
         let temp_dir = tempfile::tempdir().unwrap();

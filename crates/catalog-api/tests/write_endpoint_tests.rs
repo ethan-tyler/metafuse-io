@@ -5,6 +5,9 @@
 //!
 //! Run with: `cargo test -p metafuse-catalog-api --features "api-keys,test-utils" --test write_endpoint_tests`
 
+// This test module requires both api-keys and test-utils features
+#![cfg(all(feature = "api-keys", feature = "test-utils"))]
+
 use axum::{
     body::Body,
     http::{header::AUTHORIZATION, Request, StatusCode},

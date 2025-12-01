@@ -407,6 +407,7 @@ mod quality_framework {
 // Control Plane Audit Log Integration Tests
 // ============================================================================
 
+#[cfg(feature = "test-utils")]
 mod control_plane_audit {
     use metafuse_catalog_api::test_utils::{TestControlPlane, TestTenantBuilder};
 

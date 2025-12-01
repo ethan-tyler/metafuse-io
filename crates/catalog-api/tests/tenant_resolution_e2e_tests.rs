@@ -9,6 +9,9 @@
 //!
 //! Run with: `cargo test -p metafuse-catalog-api --features "api-keys,test-utils" --test tenant_resolution_e2e_tests`
 
+// This test module requires both api-keys and test-utils features
+#![cfg(all(feature = "api-keys", feature = "test-utils"))]
+
 use axum::{
     body::Body,
     extract::Extension,

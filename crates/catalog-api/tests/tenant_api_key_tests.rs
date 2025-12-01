@@ -5,6 +5,9 @@
 //!
 //! Run with: `cargo test -p metafuse-catalog-api --features "api-keys,test-utils" --test tenant_api_key_tests`
 
+// This test module requires both api-keys and test-utils features
+#![cfg(all(feature = "api-keys", feature = "test-utils"))]
+
 use metafuse_catalog_api::control_plane::TenantRole;
 use metafuse_catalog_api::test_utils::{
     test_audit_context, TestApiKey, TestControlPlane, TestTenantBuilder,

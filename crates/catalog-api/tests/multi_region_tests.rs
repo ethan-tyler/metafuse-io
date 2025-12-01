@@ -6,6 +6,9 @@
 //! - API key region context
 //! - Environment-based region defaults
 
+// This test module requires the test-utils feature
+#![cfg(feature = "test-utils")]
+
 use metafuse_catalog_api::test_utils::{
     assert_tenant_region, fixtures, TestControlPlane, TestTenantBuilder,
 };
