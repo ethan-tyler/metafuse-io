@@ -157,7 +157,7 @@ jobs:
 
       - name: Upload test results
         if: always() && steps.docker_check.outputs.skip != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: cloud-test-results-${{ matrix.backend.name }}
           path: |
