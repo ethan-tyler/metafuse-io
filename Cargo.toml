@@ -46,7 +46,7 @@ lru = "0.12"
 regex = "1"
 
 # Metrics (optional)
-prometheus = "0.13"
+prometheus = "0.14"
 lazy_static = "1.4"
 
 # Rate limiting (optional)
