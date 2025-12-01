@@ -53,7 +53,7 @@ lazy_static = "1.4"
 dashmap = "6.0"
 
 # API keys (optional)
-bcrypt = "0.15"
+bcrypt = "0.17"
 rand = "0.8"
 hex = "0.4"
 
