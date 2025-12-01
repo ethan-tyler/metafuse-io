@@ -174,16 +174,25 @@ impl AsRef<str> for TenantContext {
 }
 
 /// Tenant tier for quota and rate limiting.
+///
+/// # Default Behavior
+///
+/// The default tier is `Standard`. This is used as a fallback when:
+/// - Parsing an invalid tier string (e.g., `"invalid".parse::<TenantTier>().unwrap_or_default()`)
+/// - Header-only tenant resolution where tier is looked up from DB
+///
+/// Note: Tier values are validated at API boundaries (tenant creation/update),
+/// so invalid tiers in the database would only occur via direct DB manipulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TenantTier {
-    /// Free tier with basic quotas
+    /// Free tier with basic quotas (100 req/min rate limit)
     Free,
-    /// Standard tier with higher quotas
+    /// Standard tier with higher quotas (1000 req/min rate limit)
     #[default]
     Standard,
-    /// Premium tier with generous quotas
+    /// Premium tier with generous quotas (5000 req/min rate limit)
     Premium,
-    /// Enterprise tier with custom quotas
+    /// Enterprise tier with custom quotas (10000 req/min rate limit)
     Enterprise,
 }
 
@@ -355,6 +364,21 @@ mod tests {
             Some(TenantTier::Enterprise)
         );
         assert!("unknown".parse::<TenantTier>().is_err());
+    }
+
+    #[test]
+    fn test_tenant_tier_default_is_standard() {
+        // Documents intentional behavior: TenantTier defaults to Standard.
+        // This fallback is used when parsing fails (e.g., invalid DB value).
+        // Note: Tier strings are validated at API boundaries; invalid values
+        // should only occur via direct DB manipulation or migration issues.
+        assert_eq!(TenantTier::default(), TenantTier::Standard);
+
+        // Demonstrate the unwrap_or_default pattern used in rate limiting
+        let invalid_tier: std::result::Result<TenantTier, _> = "invalid".parse();
+        assert!(invalid_tier.is_err());
+        let fallback = invalid_tier.unwrap_or_default();
+        assert_eq!(fallback, TenantTier::Standard);
     }
 
     #[test]

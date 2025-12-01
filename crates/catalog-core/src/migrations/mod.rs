@@ -41,6 +41,7 @@ use rusqlite::Connection;
 mod v1_0_0;
 mod v1_1_0;
 mod v1_2_0;
+mod v1_3_0;
 
 /// Migration version number.
 pub type MigrationVersion = i64;
@@ -65,6 +66,7 @@ pub fn all_migrations() -> Vec<Migration> {
         v1_0_0::migration(),
         v1_1_0::migration(),
         v1_2_0::migration(),
+        v1_3_0::migration(),
     ]
 }
 

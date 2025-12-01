@@ -72,6 +72,9 @@ pub const MAX_CACHE_CAPACITY: usize = 10_000;
 /// Placeholder for tenant ID in URI templates.
 const TENANT_ID_PLACEHOLDER: &str = "{tenant_id}";
 
+/// Placeholder for region in URI templates.
+const REGION_PLACEHOLDER: &str = "{region}";
+
 // =============================================================================
 // Connection Pool Types
 // =============================================================================
@@ -534,14 +537,65 @@ impl TenantBackendFactory {
     /// assert_eq!(uri, "gs://bucket/acme-corp/db");
     /// ```
     pub fn resolve_uri(&self, tenant_id: &str) -> String {
+        self.resolve_uri_with_region(tenant_id, None)
+    }
+
+    /// Resolve a tenant ID and optional region to a storage URI.
+    ///
+    /// Replaces `{tenant_id}` and `{region}` placeholders with actual values.
+    /// If the template contains `{region}` placeholder, it will be replaced.
+    /// If no placeholder exists but region is provided for S3 URIs, appends `?region=` query param.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant_id` - Validated tenant identifier
+    /// * `region` - Optional region (e.g., "us-east1", "europe-west1")
+    ///
+    /// # Safety
+    ///
+    /// This method assumes the tenant_id has already been validated via `TenantContext::new()`.
+    /// Region values should contain only alphanumeric characters and hyphens.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// // Template with region placeholder
+    /// let factory = TenantBackendFactory::new("s3://bucket-{region}/{tenant_id}/db", 10)?;
+    /// let uri = factory.resolve_uri_with_region("acme-corp", Some("us-east1"));
+    /// assert_eq!(uri, "s3://bucket-us-east1/acme-corp/db");
+    ///
+    /// // Template without region placeholder (S3 appends query param)
+    /// let factory = TenantBackendFactory::new("s3://bucket/{tenant_id}/db", 10)?;
+    /// let uri = factory.resolve_uri_with_region("acme-corp", Some("us-east1"));
+    /// assert_eq!(uri, "s3://bucket/acme-corp/db?region=us-east1");
+    /// ```
+    pub fn resolve_uri_with_region(&self, tenant_id: &str, region: Option<&str>) -> String {
         // Defense-in-depth: reject any path traversal attempts
         debug_assert!(
             !tenant_id.contains("..") && !tenant_id.contains('/') && !tenant_id.contains('\\'),
             "tenant_id should be validated to prevent path traversal"
         );
 
-        self.storage_uri_template
-            .replace(TENANT_ID_PLACEHOLDER, tenant_id)
+        let mut uri = self
+            .storage_uri_template
+            .replace(TENANT_ID_PLACEHOLDER, tenant_id);
+
+        // Handle region placeholder
+        if uri.contains(REGION_PLACEHOLDER) {
+            let resolved_region = region.unwrap_or("default");
+            uri = uri.replace(REGION_PLACEHOLDER, resolved_region);
+        } else if let Some(r) = region {
+            // Append region to S3 URIs without placeholder
+            if uri.starts_with("s3://") && !uri.contains("?region=") {
+                if uri.contains('?') {
+                    uri = format!("{}&region={}", uri, r);
+                } else {
+                    uri = format!("{}?region={}", uri, r);
+                }
+            }
+        }
+
+        uri
     }
 
     /// Validate that a tenant ID is safe for URI substitution.
@@ -630,6 +684,81 @@ impl TenantBackendFactory {
         Ok(backend)
     }
 
+    /// Get or create a backend for the given tenant with optional region.
+    ///
+    /// This method supports multi-region deployments where the same tenant
+    /// may have backends in different regions.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - Validated tenant context
+    /// * `region` - Optional region (e.g., "us-east1", "europe-west1")
+    ///
+    /// # Returns
+    ///
+    /// An `Arc<dyn CatalogBackend>` that can be used for catalog operations.
+    /// The backend is cached using a composite key: `tenant_id@region`.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if backend creation fails (e.g., invalid URI, missing credentials).
+    pub async fn get_backend_with_region(
+        &self,
+        tenant: &TenantContext,
+        region: Option<&str>,
+    ) -> Result<Arc<dyn CatalogBackend>> {
+        let tenant_id = tenant.tenant_id();
+        // Cache key includes region for isolation
+        let cache_key = Self::make_cache_key(tenant_id, region);
+
+        // Try to get from cache first
+        {
+            let mut cache = self.cache.lock();
+            if let Some(backend) = cache.get(&cache_key) {
+                debug!(tenant_id = %tenant_id, region = ?region, "Backend cache hit");
+                return Ok(Arc::clone(backend));
+            }
+        }
+
+        // Cache miss - create new backend
+        debug!(tenant_id = %tenant_id, region = ?region, "Backend cache miss, creating new backend");
+
+        let uri = self.resolve_uri_with_region(tenant_id, region);
+        let backend = backend_from_uri(&uri)?;
+        let backend: Arc<dyn CatalogBackend> = Arc::from(backend);
+
+        // Insert into cache
+        {
+            let mut cache = self.cache.lock();
+
+            // Check if another task already inserted while we were creating
+            if let Some(existing) = cache.get(&cache_key) {
+                debug!(tenant_id = %tenant_id, region = ?region, "Backend created by concurrent task, using existing");
+                return Ok(Arc::clone(existing));
+            }
+
+            // Check if we're about to evict
+            if cache.len() >= self.capacity {
+                if let Some((evicted_key, _)) = cache.peek_lru() {
+                    debug!(evicted_key = %evicted_key, cache_key = %cache_key, "Evicting LRU tenant backend");
+                }
+            }
+
+            cache.put(cache_key.clone(), Arc::clone(&backend));
+            debug!(tenant_id = %tenant_id, region = ?region, cache_size = cache.len(), "Cached tenant backend");
+        }
+
+        Ok(backend)
+    }
+
+    /// Create a cache key from tenant ID and optional region.
+    fn make_cache_key(tenant_id: &str, region: Option<&str>) -> String {
+        match region {
+            Some(r) => format!("{}@{}", tenant_id, r),
+            None => tenant_id.to_string(),
+        }
+    }
+
     /// Get a connection-limited backend handle for the given tenant.
     ///
     /// This is the **primary method** for acquiring tenant backends with connection pooling.
@@ -686,6 +815,58 @@ impl TenantBackendFactory {
         })
     }
 
+    /// Get a connection-limited backend handle for the given tenant with optional region.
+    ///
+    /// This is the **primary method** for acquiring region-aware tenant backends.
+    /// Returns an RAII handle that automatically releases the connection permit on drop.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - Validated tenant context
+    /// * `region` - Optional region (e.g., "us-east1", "europe-west1")
+    ///
+    /// # Returns
+    ///
+    /// A `TenantBackendHandle` that wraps the backend and releases the permit on drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Tenant is suspended (immediate rejection)
+    /// - Circuit breaker is open for the tenant
+    /// - Timeout waiting for connection permit
+    /// - Backend creation fails
+    pub async fn get_backend_handle_with_region(
+        &self,
+        tenant: &TenantContext,
+        region: Option<&str>,
+    ) -> Result<TenantBackendHandle> {
+        let tenant_id = tenant.tenant_id().to_string();
+
+        // 1. Acquire permit first (backpressure before doing work)
+        let permit = self.semaphore_pool.acquire_permit(&tenant_id).await?;
+
+        // 2. Get backend from cache (or create)
+        let backend = match self.get_backend_with_region(tenant, region).await {
+            Ok(b) => {
+                self.semaphore_pool.record_success(&tenant_id);
+                b
+            }
+            Err(e) => {
+                self.semaphore_pool.record_failure(&tenant_id);
+                return Err(e);
+            }
+        };
+
+        // 3. Wrap in RAII handle
+        Ok(TenantBackendHandle {
+            backend,
+            tenant_id,
+            _permit: permit,
+            acquired_at: Instant::now(),
+        })
+    }
+
     /// Get a backend by tenant ID string (validates and creates context internally).
     ///
     /// Convenience method that validates the tenant ID and gets the backend.
@@ -712,6 +893,7 @@ impl TenantBackendFactory {
     /// Invalidate (remove) a tenant's backend from the cache.
     ///
     /// Use this when a tenant is deleted or needs their backend refreshed.
+    /// This removes all region-specific entries for the tenant.
     ///
     /// # Arguments
     ///
@@ -719,14 +901,32 @@ impl TenantBackendFactory {
     ///
     /// # Returns
     ///
-    /// `true` if the tenant was in the cache and removed, `false` otherwise.
+    /// `true` if any entries were removed, `false` otherwise.
     pub fn invalidate(&self, tenant_id: &str) -> bool {
         let mut cache = self.cache.lock();
-        let removed = cache.pop(tenant_id).is_some();
-        if removed {
-            info!(tenant_id = %tenant_id, "Invalidated tenant backend from cache");
+
+        // Collect keys to remove: exact match OR region-qualified (tenant_id@region)
+        let region_prefix = format!("{}@", tenant_id);
+        let keys_to_remove: Vec<String> = cache
+            .iter()
+            .filter_map(|(k, _)| {
+                if k == tenant_id || k.starts_with(&region_prefix) {
+                    Some(k.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let count = keys_to_remove.len();
+        for key in keys_to_remove {
+            cache.pop(&key);
         }
-        removed
+
+        if count > 0 {
+            info!(tenant_id = %tenant_id, count = count, "Invalidated tenant backend(s) from cache");
+        }
+        count > 0
     }
 
     /// Clear all cached backends.
@@ -970,6 +1170,47 @@ mod tests {
 
         // Invalidate non-existent
         assert!(!factory.invalidate("non-existent"));
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_with_regions() {
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp_dir.path().join("tenant-r")).unwrap();
+        std::fs::create_dir_all(temp_dir.path().join("tenant-r-other")).unwrap();
+
+        let factory = TenantBackendFactory::new(test_template(&temp_dir), 10).unwrap();
+        let ctx = TenantContext::new("tenant-r").unwrap();
+        let ctx_other = TenantContext::new("tenant-r-other").unwrap();
+
+        // Create backends for same tenant in multiple regions
+        let _b1 = factory.get_backend_with_region(&ctx, None).await.unwrap();
+        let _b2 = factory
+            .get_backend_with_region(&ctx, Some("us-east1"))
+            .await
+            .unwrap();
+        let _b3 = factory
+            .get_backend_with_region(&ctx, Some("europe-west1"))
+            .await
+            .unwrap();
+        // Different tenant with region (should NOT be invalidated)
+        let _b4 = factory
+            .get_backend_with_region(&ctx_other, Some("us-east1"))
+            .await
+            .unwrap();
+
+        // Should have 4 cached entries
+        assert_eq!(factory.cache_size(), 4);
+
+        // Invalidate tenant-r - should remove all 3 region entries
+        assert!(factory.invalidate("tenant-r"));
+
+        // Should only have the tenant-r-other entry left
+        assert_eq!(factory.cache_size(), 1);
+        assert!(!factory.is_cached("tenant-r"));
+        // Note: is_cached checks exact key, so region entries aren't directly checkable
+
+        // The other tenant's entry should still be cached
+        // (We can verify by checking cache_size remained at 1)
     }
 
     #[tokio::test]

@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Phase 7: Multi-Region Foundation & Tenant Metrics
+
+This release adds tenant-level observability metrics and foundational multi-region support for control plane tenants.
+
+#### Added
+
+- **Tenant Metrics (Phase 7A)**
+  - Connection pool metrics per tenant (`tenant_active_connections`, `tenant_connection_wait_seconds`)
+  - Cache hit/miss rates (`tenant_backend_cache_hits_total`, `tenant_backend_cache_misses_total`, `tenant_backend_cache_size`)
+  - Circuit breaker state metrics (`tenant_circuit_breaker_state`, `tenant_circuit_breaker_trips_total`)
+  - Tenant lifecycle event counters (`tenant_lifecycle_events_total` with `create`, `suspend`, `reactivate`, `delete`, `purge`)
+  - API call tracking by tenant and tier (`tenant_api_calls_total`)
+  - Dataset count gauge per tenant (`tenant_datasets_total`)
+
+- **Multi-Region Foundation (Phase 7B)**
+  - Schema migration v1.3.0 adding `region` column to `tenants` table
+  - Region field on `CreateTenantRequest` and `UpdateTenantRequest`
+  - Region-aware URI placeholder resolution (`{region}` in storage URI templates)
+  - `TenantBackendFactory::resolve_uri_with_region()` method
+  - End-to-end region propagation from database through API key validation to request pipeline
+
+#### Changed
+
+- `ValidatedTenantKey` now includes tenant region from control plane database
+- `CachedTenantKey` carries region for cache-aware lookups
+- `ResolvedTenant.region()` returns actual tenant region (was always `None`)
+- Cache invalidation now handles region-qualified keys (`tenant_id@region`)
+- API key validation SQL joins tenants table to fetch region during authentication
+
+#### Migration Notes
+
+- v1.3.0 migration is idempotent and backward-compatible
+- Existing tenants without region continue to work (region is nullable)
+- When region is NULL, default region from `METAFUSE_DEFAULT_REGION` environment variable is used
+- Storage URI templates support `{region}` placeholder: `gs://bucket/{region}/{tenant_id}/catalog.db`
+
 ---
 
 ## [0.7.0] - 2025-11-29
