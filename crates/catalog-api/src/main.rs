@@ -73,6 +73,7 @@ use control_plane::{
     TenantApiKey, TenantRole, UpdateTenantRequest,
 };
 
+#[cfg(feature = "api-keys")]
 use axum::http::HeaderMap;
 
 /// Request ID for tracking requests through the system

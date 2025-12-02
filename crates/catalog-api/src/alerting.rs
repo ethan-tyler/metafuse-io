@@ -501,6 +501,7 @@ impl std::error::Error for WebhookError {}
 ///
 /// The tenant_id parameter enables multi-tenant isolation for alert history.
 /// If not provided, alerts are not scoped to a tenant (legacy behavior).
+#[allow(clippy::too_many_arguments)]
 pub fn record_alert(
     conn: &rusqlite::Connection,
     alert_type: AlertType,

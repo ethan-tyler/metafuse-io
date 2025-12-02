@@ -185,11 +185,10 @@ pub fn validate_webhook_url(url: &str) -> Option<String> {
     }
 
     // Check for valid URL structure
-    let after_scheme = if url.starts_with("https://") {
-        &url[8..]
-    } else {
-        &url[7..]
-    };
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or("");
 
     if after_scheme.is_empty() {
         return Some("URL must have a host".to_string());
@@ -260,21 +259,16 @@ pub struct FreshnessContract {
 }
 
 /// Enforcement action on contract violation
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OnViolation {
     /// Send alert but allow operation
+    #[default]
     Alert,
     /// Log warning but allow operation
     Warn,
     /// Block the operation
     Block,
-}
-
-impl Default for OnViolation {
-    fn default() -> Self {
-        OnViolation::Alert
-    }
 }
 
 impl OnViolation {
@@ -524,14 +518,11 @@ fn matches_pattern(pattern: &str, name: &str) -> bool {
 
     if pattern.contains('*') {
         // Convert glob to simple prefix/suffix match
-        if pattern.starts_with('*') && pattern.ends_with('*') {
-            let middle = &pattern[1..pattern.len() - 1];
+        if let Some(middle) = pattern.strip_prefix('*').and_then(|p| p.strip_suffix('*')) {
             name.contains(middle)
-        } else if pattern.starts_with('*') {
-            let suffix = &pattern[1..];
+        } else if let Some(suffix) = pattern.strip_prefix('*') {
             name.ends_with(suffix)
-        } else if pattern.ends_with('*') {
-            let prefix = &pattern[..pattern.len() - 1];
+        } else if let Some(prefix) = pattern.strip_suffix('*') {
             name.starts_with(prefix)
         } else {
             // Pattern like "foo*bar" - simple contains check for parts
