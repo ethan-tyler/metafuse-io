@@ -23,10 +23,13 @@ usage-analytics = ["dashmap"]
 classification = ["regex"]
 # v0.8.0: Quota enforcement
 quota-enforcement = ["api-keys"]
+# v0.9.0: Alerting and Data Contracts
+alerting = ["reqwest", "rand"]
+contracts = []
 # Enterprise bundle (all enterprise features)
 enterprise = ["audit", "usage-analytics", "classification"]
-# Production bundle (enterprise + security + quotas)
-production = ["enterprise", "rate-limiting", "api-keys", "metrics", "quota-enforcement"]
+# Production bundle (enterprise + security + quotas + alerting + contracts)
+production = ["enterprise", "rate-limiting", "api-keys", "metrics", "quota-enforcement", "alerting", "contracts"]
 # Test utilities for integration tests
 test-utils = ["tempfile"]
 
@@ -61,6 +64,9 @@ hex = { workspace = true, optional = true }
 
 # Optional: Classification (Phase 3)
 regex = { workspace = true, optional = true }
+
+# Optional: Alerting (v0.9.0)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 
 # Optional: Test utilities
 tempfile = { workspace = true, optional = true }

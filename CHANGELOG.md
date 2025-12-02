@@ -7,6 +7,172 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2025-12-02
+
+### Alerting & Data Contracts Release
+
+This release introduces a production-grade alerting system with webhook delivery and data contracts for pipeline reliability. Designed for Servo integration and multi-tenant SaaS deployments.
+
+#### Added
+
+- **Alerting System**
+  - Background alert checking task with configurable intervals (default: 60s)
+  - Webhook delivery with exponential backoff and ±25% jitter
+  - Alert history with delivery tracking (pending/delivered/failed)
+  - Freshness alerts wired to `freshness_config.alert_on_stale`
+  - Quality threshold alerts from data contracts
+  - Schema change detection alerts
+  - Contract violation alerts
+  - Cooldown deduplication (default: 1 hour) to prevent alert spam
+  - URL redaction in logs to prevent secret leakage
+
+- **Data Contracts**
+  - Schema contracts (required columns, types, nullability)
+  - Quality contracts (min_completeness, min_freshness, min_overall thresholds)
+  - Freshness contracts (max_staleness_secs, expected_interval_secs)
+  - Pattern matching for dataset names (supports `*` wildcards)
+  - Contract versioning support
+  - Enforcement actions: `alert`, `warn`, `block`
+
+- **Input Validation**
+  - Contract name validation (alphanumeric + underscore, max 128 chars)
+  - Dataset pattern validation (non-empty, max 256 chars)
+  - Webhook URL validation (http/https schemes only, SSRF prevention)
+  - Quality contract range validation (0.0-1.0)
+  - Freshness contract positive value validation
+  - Schema contract column validation
+
+- **API Endpoints**
+  - `GET /api/v1/alerts` - List alert history with pagination and filtering
+  - `GET /api/v1/contracts` - List data contracts
+  - `POST /api/v1/contracts` - Create contract (with validation)
+  - `GET /api/v1/contracts/:name` - Get contract details
+  - `PUT /api/v1/contracts/:name` - Update contract
+  - `DELETE /api/v1/contracts/:name` - Delete contract
+
+- **Prometheus Metrics**
+  - `alerts_fired_total` - Counter by alert_type and severity
+  - `alerts_delivered_total` - Counter by alert_type
+  - `alerts_delivery_failed_total` - Counter by alert_type
+  - `webhook_requests_total` - Counter by status_code and alert_type
+  - `webhook_request_duration_seconds` - Histogram by alert_type
+  - `alert_check_active` - Gauge for health monitoring (0 or 1)
+  - `contracts_checks_total` - Counter for contract validation
+  - `contracts_violations_total` - Counter for contract violations
+
+- **Feature Flags**
+  - `alerting` - Enable alerting system and background task
+  - `contracts` - Enable data contracts module
+  - Both included in `production` feature bundle
+
+#### Security
+
+- **Tenant Isolation in Alert History**
+  - Added `tenant_id` column to `alert_history` table (v1.5.0 migration)
+  - Backfill from associated dataset's tenant (v1.5.1 migration)
+  - Indexes for efficient tenant-scoped queries
+  - `list_alerts` handler enforces tenant isolation by overriding user-provided tenant_id
+
+- **Webhook URL Validation**
+  - Only http:// and https:// schemes allowed
+  - Protection against newline/null byte injection
+  - Maximum URL length (2048 chars)
+
+- **Input Validation**
+  - Prevents SQL injection via pattern validation
+  - Prevents XSS via name validation
+  - All validation errors returned with field-specific messages
+
+#### Database Migrations
+
+- **v1.4.0**: Initial `alert_history` and `data_contracts` tables
+  - `alert_history`: alert tracking with delivery status
+  - `data_contracts`: contract definitions with JSON fields
+  - Indexes for common query patterns
+  - CHECK constraints for valid enum values
+
+- **v1.5.0**: Add `tenant_id` column to `alert_history`
+  - Nullable for backwards compatibility
+  - Column added via `add_columns` mechanism
+
+- **v1.5.1**: Backfill tenant_id and create indexes
+  - Backfills from associated dataset's tenant
+  - Creates `idx_alert_history_tenant` index
+  - Creates `idx_alert_history_tenant_created` composite index
+
+#### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `METAFUSE_ALERT_CHECK_INTERVAL_SECS` | 60 | How often to check for stale datasets |
+| `METAFUSE_ALERT_COOLDOWN_SECS` | 3600 | Cooldown between re-alerting same condition |
+| `METAFUSE_WEBHOOK_TIMEOUT_SECS` | 10 | Timeout for webhook HTTP requests |
+| `METAFUSE_WEBHOOK_MAX_RETRIES` | 3 | Maximum delivery attempts |
+
+#### Testing
+
+- 53 new tests for v0.9.0 features
+  - 19 alerting tests (payload creation, delivery, history)
+  - 11 migration tests (v1.5.0, v1.5.1)
+  - 23 contracts tests (CRUD, validation, pattern matching)
+- Total: 184+ tests passing
+
+#### Migration Notes
+
+- **Database migrations required**: v1.4.0, v1.5.0, v1.5.1 run automatically
+- **Feature flags**: Enable with `--features alerting,contracts` or `--features production`
+- **Existing deployments**: No breaking changes; new features are additive
+
+---
+
+## [0.8.0] - 2024-12-02
+
+### Multi-Tenant Quota Enforcement
+
+This release implements comprehensive quota enforcement for the multi-tenant platform, completing foundational SaaS capabilities.
+
+#### Added
+
+- **Dataset Quota Enforcement**
+  - Quota check before dataset creation (`check_dataset_quota`)
+  - Soft limit warnings at 80% threshold (logged + returned in JSON response)
+  - Hard limit blocking when quota exceeded (HTTP 403)
+  - Zero/negative quotas treated as unlimited
+
+- **Dry-Run Mode for Safe Rollout**
+  - `METAFUSE_QUOTA_DRY_RUN=true` (default) - logs violations but doesn't block
+  - `METAFUSE_QUOTA_DRY_RUN=false` - enables actual enforcement
+  - Allows metering before enforcing in production
+
+- **Usage Endpoints**
+  - `GET /api/v1/admin/tenants/:id/usage` - Admin visibility into tenant usage
+  - `GET /api/v1/usage` - Tenant self-service usage check
+  - Returns: dataset_count, quota limits, usage_ratio, status (ok/warning/exceeded/unlimited)
+
+- **Prometheus Quota Metrics**
+  - `tenant_quota_checks_total` - Counter by result (ok, exceeded, warning)
+  - `tenant_quota_usage_ratio` - Gauge for current usage ratio per tenant
+  - `tenant_quota_enforcement_total` - Counter by action (blocked, dry_run_allowed)
+  - Cardinality control via `METAFUSE_TENANT_METRICS_INCLUDE_ID` environment variable
+
+- **Feature Flag**
+  - `quota-enforcement` feature flag for gradual rollout
+  - Included in `production` feature bundle
+
+#### Security
+
+- Admin usage endpoint requires platform admin authentication
+- Tenant usage endpoint requires valid API key with tenant context
+- RBAC enforced via existing middleware stack
+
+#### Migration Notes
+
+- No database migrations required
+- Existing tenants continue to work with their defined quota fields
+- Deploy with `METAFUSE_QUOTA_DRY_RUN=true` initially to monitor before enforcement
+
+---
+
 ### Phase 7: Multi-Region Foundation & Tenant Metrics
 
 This release adds tenant-level observability metrics and foundational multi-region support for control plane tenants.
@@ -1025,7 +1191,15 @@ See `MIGRATION_v0.4.0.md` for detailed migration instructions.
 
 ---
 
-[Unreleased]: https://github.com/ethan-tyler/MetaFuse/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/ethan-tyler/MetaFuse/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/ethan-tyler/MetaFuse/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/ethan-tyler/MetaFuse/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/ethan-tyler/MetaFuse/compare/v0.6.1...v0.7.0
+[0.6.1]: https://github.com/ethan-tyler/MetaFuse/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/ethan-tyler/MetaFuse/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/ethan-tyler/MetaFuse/compare/v0.4.3...v0.5.0
+[0.4.3]: https://github.com/ethan-tyler/MetaFuse/compare/v0.4.2...v0.4.3
+[0.4.2]: https://github.com/ethan-tyler/MetaFuse/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/ethan-tyler/MetaFuse/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/ethan-tyler/MetaFuse/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/ethan-tyler/MetaFuse/compare/v0.3.0...v0.3.1

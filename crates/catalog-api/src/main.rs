@@ -31,6 +31,12 @@ mod control_plane;
 #[cfg(feature = "api-keys")]
 mod tenant_resolver;
 
+#[cfg(feature = "alerting")]
+use metafuse_catalog_api::alerting;
+
+#[cfg(feature = "contracts")]
+use metafuse_catalog_api::contracts;
+
 use axum::{
     extract::{Extension, Path, Query, Request, State},
     http::{header, HeaderValue, StatusCode},
@@ -67,6 +73,7 @@ use control_plane::{
     TenantApiKey, TenantRole, UpdateTenantRequest,
 };
 
+#[cfg(feature = "api-keys")]
 use axum::http::HeaderMap;
 
 /// Request ID for tracking requests through the system
@@ -925,6 +932,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracker
     };
 
+    // Initialize alerting background task if feature enabled
+    #[cfg(feature = "alerting")]
+    {
+        let webhook_client = Arc::new(alerting::WebhookClient::new_default());
+        let backend_clone = Arc::clone(&backend);
+        tokio::spawn(async move {
+            alerting::alert_check_task(webhook_client, backend_clone).await;
+        });
+        tracing::info!("Alerting background task started");
+    }
+
     // Initialize multi-tenant resources
     let mt_config = MultiTenantConfig::from_env();
     mt_config.validate()?;
@@ -1054,6 +1072,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/v1/fields/:id/classification",
             axum::routing::put(set_field_classification),
+        );
+
+    // Alerting endpoints (v0.9.0)
+    #[cfg(feature = "alerting")]
+    let app = app.route("/api/v1/alerts", get(list_alerts));
+
+    // Contract endpoints (v0.9.0)
+    #[cfg(feature = "contracts")]
+    let app = app
+        .route(
+            "/api/v1/contracts",
+            get(list_contracts).post(create_contract),
+        )
+        .route(
+            "/api/v1/contracts/:name",
+            get(get_contract)
+                .put(update_contract)
+                .delete(delete_contract),
         );
 
     // Add metrics endpoint if metrics feature is enabled
@@ -3098,7 +3134,10 @@ fn check_dataset_quota(
     let quota_max = tenant.quota_max_datasets;
     let tenant_id = &tenant.tenant_id;
 
-    // Unlimited quota (0 or negative means no limit)
+    // Defensive check: treat 0 or negative as unlimited
+    // Note: The database has a CHECK constraint (quota_max_datasets > 0) that prevents
+    // storing invalid values. This check is defensive programming for edge cases like
+    // manual database modifications or future schema changes.
     if quota_max <= 0 {
         #[cfg(feature = "metrics")]
         metrics::record_quota_check_ok(tenant_id, "datasets");
@@ -6853,6 +6892,267 @@ async fn get_dataset_history(
     };
 
     Ok(Json(response))
+}
+
+// =============================================================================
+// Alerting Endpoints (v0.9.0)
+// =============================================================================
+
+/// List alert history
+///
+/// SECURITY: This handler enforces tenant isolation by overriding any
+/// tenant_id passed in query params with the resolved tenant from the
+/// request context. This prevents cross-tenant data leakage.
+#[cfg(feature = "alerting")]
+async fn list_alerts(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    Query(mut params): Query<alerting::AlertHistoryParams>,
+) -> Result<Json<alerting::AlertHistoryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // CRITICAL: Enforce tenant isolation by overriding tenant_id from request context
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
+
+    // Override any user-provided tenant_id with the authenticated tenant
+    params.tenant_id = Some(tenant_id.to_string());
+
+    tracing::debug!(tenant_id = %tenant_id, "Listing alert history");
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let response = alerting::query_alert_history(&conn, &params)
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    Ok(Json(response))
+}
+
+// =============================================================================
+// Contract Endpoints (v0.9.0)
+// =============================================================================
+
+/// List all contracts
+#[cfg(feature = "contracts")]
+async fn list_contracts(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+) -> Result<Json<Vec<contracts::DataContract>>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, "Listing contracts");
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let contracts = contracts::list_contracts(&conn)
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    Ok(Json(contracts))
+}
+
+/// Create a new contract
+#[cfg(feature = "contracts")]
+async fn create_contract(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    Json(contract): Json<contracts::DataContract>,
+) -> Result<Json<ContractCreatedResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, contract_name = %contract.name, "Creating contract");
+
+    // Validate contract input
+    let validation_errors = contracts::validate_contract(&contract);
+    if !validation_errors.is_empty() {
+        let error_messages: Vec<String> = validation_errors
+            .iter()
+            .map(|e| format!("{}: {}", e.field, e.message))
+            .collect();
+        return Err(bad_request(
+            format!("Validation failed: {}", error_messages.join("; ")),
+            request_id.0.clone(),
+        ));
+    }
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let id = contracts::create_contract(&conn, &contract).map_err(|e| {
+        if e.to_string().contains("UNIQUE constraint") {
+            bad_request(
+                format!("Contract '{}' already exists", contract.name),
+                request_id.0.clone(),
+            )
+        } else {
+            internal_error(e.to_string(), request_id.0.clone())
+        }
+    })?;
+
+    Ok(Json(ContractCreatedResponse {
+        id,
+        name: contract.name,
+        message: "Contract created successfully".to_string(),
+    }))
+}
+
+#[cfg(feature = "contracts")]
+#[derive(Serialize)]
+struct ContractCreatedResponse {
+    id: i64,
+    name: String,
+    message: String,
+}
+
+/// Get a contract by name
+#[cfg(feature = "contracts")]
+async fn get_contract(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    Path(name): Path<String>,
+) -> Result<Json<contracts::DataContract>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, contract_name = %name, "Getting contract");
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let contract = contracts::get_contract(&conn, &name)
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
+        .ok_or_else(|| {
+            not_found(
+                format!("Contract '{}' not found", name),
+                request_id.0.clone(),
+            )
+        })?;
+
+    Ok(Json(contract))
+}
+
+/// Update an existing contract
+#[cfg(feature = "contracts")]
+async fn update_contract(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    Path(name): Path<String>,
+    Json(contract): Json<contracts::DataContract>,
+) -> Result<Json<ContractUpdatedResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, contract_name = %name, "Updating contract");
+
+    // Validate contract input
+    let validation_errors = contracts::validate_contract(&contract);
+    if !validation_errors.is_empty() {
+        let error_messages: Vec<String> = validation_errors
+            .iter()
+            .map(|e| format!("{}: {}", e.field, e.message))
+            .collect();
+        return Err(bad_request(
+            format!("Validation failed: {}", error_messages.join("; ")),
+            request_id.0.clone(),
+        ));
+    }
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let updated = contracts::update_contract(&conn, &name, &contract)
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    if !updated {
+        return Err(not_found(
+            format!("Contract '{}' not found", name),
+            request_id.0.clone(),
+        ));
+    }
+
+    Ok(Json(ContractUpdatedResponse {
+        name,
+        version: contract.version,
+        message: "Contract updated successfully".to_string(),
+    }))
+}
+
+#[cfg(feature = "contracts")]
+#[derive(Serialize)]
+struct ContractUpdatedResponse {
+    name: String,
+    version: i32,
+    message: String,
+}
+
+/// Delete a contract
+#[cfg(feature = "contracts")]
+async fn delete_contract(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    Path(name): Path<String>,
+) -> Result<Json<ContractDeletedResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, contract_name = %name, "Deleting contract");
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let deleted = contracts::delete_contract(&conn, &name)
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    if !deleted {
+        return Err(not_found(
+            format!("Contract '{}' not found", name),
+            request_id.0.clone(),
+        ));
+    }
+
+    Ok(Json(ContractDeletedResponse {
+        name,
+        message: "Contract deleted successfully".to_string(),
+    }))
+}
+
+#[cfg(feature = "contracts")]
+#[derive(Serialize)]
+struct ContractDeletedResponse {
+    name: String,
+    message: String,
 }
 
 // =============================================================================

@@ -35,6 +35,19 @@
 //! - `tenant_quota_usage_ratio` - Gauge for current quota usage ratio per tenant/resource
 //! - `tenant_quota_enforcement_total` - Counter for enforcement actions (blocked, dry_run_allowed)
 //!
+//! ## Alerting Metrics (v0.9.0)
+//!
+//! - `alerts_fired_total` - Counter for alerts fired by type and severity
+//! - `alerts_delivery_total` - Counter for alert delivery outcomes (delivered, failed)
+//! - `webhook_requests_total` - Counter for webhook HTTP requests by status code
+//! - `webhook_request_duration_seconds` - Histogram for webhook latency
+//! - `alert_check_active` - Gauge indicating if alert check is running (for health monitoring)
+//!
+//! ## Data Contract Metrics (v0.9.0)
+//!
+//! - `contracts_checks_total` - Counter for contract validations by result
+//! - `contracts_violations_total` - Counter for contract violations by type and action
+//!
 //! ## Cardinality Control
 //!
 //! Per-tenant metrics (those with `tenant_id` label) create a new Prometheus time series
@@ -241,6 +254,75 @@ lazy_static! {
         "tenant_quota_enforcement_total",
         "Quota enforcement actions (blocked vs allowed in dry-run)",
         &["tenant_id", "resource_type", "action"]  // action: "blocked", "dry_run_allowed"
+    )
+    .unwrap();
+
+    // ==========================================================================
+    // Alerting Metrics (v0.9.0)
+    // ==========================================================================
+
+    /// Counter for alerts fired by type and severity
+    /// Labels: alert_type (freshness, quality, schema, contract), severity (info, warning, critical)
+    pub static ref ALERTS_FIRED_TOTAL: CounterVec = register_counter_vec!(
+        "alerts_fired_total",
+        "Total alerts fired by type and severity",
+        &["alert_type", "severity"]
+    )
+    .unwrap();
+
+    /// Counter for alert delivery outcomes
+    /// Labels: status (delivered, failed), alert_type
+    pub static ref ALERTS_DELIVERY_TOTAL: CounterVec = register_counter_vec!(
+        "alerts_delivery_total",
+        "Alert delivery outcomes by status",
+        &["status", "alert_type"]
+    )
+    .unwrap();
+
+    /// Counter for webhook HTTP requests
+    /// Labels: status_code (2xx, 4xx, 5xx), alert_type
+    pub static ref WEBHOOK_REQUESTS_TOTAL: CounterVec = register_counter_vec!(
+        "webhook_requests_total",
+        "Total webhook HTTP requests",
+        &["status_code", "alert_type"]
+    )
+    .unwrap();
+
+    /// Histogram for webhook request duration in seconds
+    pub static ref WEBHOOK_REQUEST_DURATION_SECONDS: HistogramVec = register_histogram_vec!(
+        "webhook_request_duration_seconds",
+        "Webhook request latency in seconds",
+        &["alert_type"],
+        vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+    )
+    .unwrap();
+
+    /// Gauge for active alert checks (to detect stuck tasks)
+    pub static ref ALERT_CHECK_ACTIVE: Gauge = register_gauge!(
+        "alert_check_active",
+        "Whether an alert check is currently running (0 or 1)"
+    )
+    .unwrap();
+
+    // ==========================================================================
+    // Data Contract Metrics (v0.9.0)
+    // ==========================================================================
+
+    /// Counter for contract checks performed
+    /// Labels: result (pass, fail), contract_type (schema, quality, freshness)
+    pub static ref CONTRACTS_CHECKS_TOTAL: CounterVec = register_counter_vec!(
+        "contracts_checks_total",
+        "Total contract validations performed",
+        &["result", "contract_type"]
+    )
+    .unwrap();
+
+    /// Counter for contract violations detected
+    /// Labels: contract_type, on_violation (alert, warn, block)
+    pub static ref CONTRACTS_VIOLATIONS_TOTAL: CounterVec = register_counter_vec!(
+        "contracts_violations_total",
+        "Total contract violations detected",
+        &["contract_type", "on_violation"]
     )
     .unwrap();
 }
@@ -681,4 +763,90 @@ pub fn record_quota_blocked(tenant_id: &str, resource_type: &str) {
 /// Convenience function to record a dry-run allowed request (would have been blocked)
 pub fn record_quota_dry_run_allowed(tenant_id: &str, resource_type: &str) {
     record_quota_enforcement(tenant_id, resource_type, "dry_run_allowed");
+}
+
+// =============================================================================
+// Alerting Metrics Helper Functions (v0.9.0)
+// =============================================================================
+
+/// Record an alert fired event
+pub fn record_alert_fired(alert_type: &str, severity: &str) {
+    ALERTS_FIRED_TOTAL
+        .with_label_values(&[alert_type, severity])
+        .inc();
+}
+
+/// Record an alert delivery outcome
+pub fn record_alert_delivery(status: &str, alert_type: &str) {
+    ALERTS_DELIVERY_TOTAL
+        .with_label_values(&[status, alert_type])
+        .inc();
+}
+
+/// Record a webhook HTTP request outcome
+pub fn record_webhook_request(status_code: u16, alert_type: &str) {
+    let status_bucket = match status_code {
+        200..=299 => "2xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "other",
+    };
+    WEBHOOK_REQUESTS_TOTAL
+        .with_label_values(&[status_bucket, alert_type])
+        .inc();
+}
+
+/// Record webhook request duration
+pub fn record_webhook_duration(alert_type: &str, duration_secs: f64) {
+    WEBHOOK_REQUEST_DURATION_SECONDS
+        .with_label_values(&[alert_type])
+        .observe(duration_secs);
+}
+
+/// Set alert check active state (for detecting stuck tasks)
+pub fn set_alert_check_active(active: bool) {
+    ALERT_CHECK_ACTIVE.set(if active { 1.0 } else { 0.0 });
+}
+
+/// Convenience: record alert fired as freshness warning
+pub fn record_freshness_alert_fired(severity: &str) {
+    record_alert_fired("freshness", severity);
+}
+
+/// Convenience: record successful alert delivery
+pub fn record_alert_delivered(alert_type: &str) {
+    record_alert_delivery("delivered", alert_type);
+}
+
+/// Convenience: record failed alert delivery
+pub fn record_alert_delivery_failed(alert_type: &str) {
+    record_alert_delivery("failed", alert_type);
+}
+
+// =============================================================================
+// Data Contract Metrics Helper Functions (v0.9.0)
+// =============================================================================
+
+/// Record a contract check result
+pub fn record_contract_check(result: &str, contract_type: &str) {
+    CONTRACTS_CHECKS_TOTAL
+        .with_label_values(&[result, contract_type])
+        .inc();
+}
+
+/// Record a contract violation
+pub fn record_contract_violation(contract_type: &str, on_violation: &str) {
+    CONTRACTS_VIOLATIONS_TOTAL
+        .with_label_values(&[contract_type, on_violation])
+        .inc();
+}
+
+/// Convenience: record a passing contract check
+pub fn record_contract_pass(contract_type: &str) {
+    record_contract_check("pass", contract_type);
+}
+
+/// Convenience: record a failing contract check
+pub fn record_contract_fail(contract_type: &str) {
+    record_contract_check("fail", contract_type);
 }

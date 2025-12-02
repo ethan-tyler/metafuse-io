@@ -35,6 +35,13 @@ pub mod tenant_resolver;
 // Multi-Tenant Integration Layer
 pub mod multi_tenant;
 
+// v0.9.0: Alerting and Data Contracts
+#[cfg(feature = "alerting")]
+pub mod alerting;
+
+#[cfg(feature = "contracts")]
+pub mod contracts;
+
 // Test utilities (feature-gated)
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
