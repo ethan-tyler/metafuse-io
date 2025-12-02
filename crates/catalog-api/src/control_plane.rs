@@ -1,7 +1,3 @@
-// Allow dead_code for public API items that are used by library consumers
-// but not within the crate itself (control plane management APIs)
-#![allow(dead_code)]
-
 //! Control Plane for Multi-Tenant Management
 //!
 //! Provides tenant lifecycle management, tenant-scoped API keys, and audit logging
@@ -168,6 +164,7 @@ impl Tenant {
     }
 
     /// Get the tenant tier as an enum.
+    #[allow(dead_code)] // Used by library consumers
     pub fn tier_enum(&self) -> Option<TenantTier> {
         self.tier.parse().ok()
     }
@@ -228,6 +225,7 @@ pub struct TenantApiKey {
 
 /// Validated tenant API key information.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields used by tenant_resolver module
 pub struct ValidatedTenantKey {
     pub key_hash: String,
     pub tenant_id: String,
@@ -319,6 +317,7 @@ impl ControlPlane {
     }
 
     /// Initialize the control plane database schema.
+    #[allow(dead_code)] // Called during server startup
     pub async fn initialize(&self) -> Result<()> {
         let db_path = self.db_path.clone();
 
@@ -1091,6 +1090,7 @@ impl ControlPlane {
     ///
     /// **WARNING**: This permanently deletes all tenant data and cannot be undone.
     /// Only works for tenants in 'pending_deletion' status.
+    #[allow(dead_code)] // GDPR feature - exposed via admin API in future
     pub async fn purge_tenant(&self, tenant_id: &str, audit: AuditContext) -> Result<()> {
         let db_path = self.db_path.clone();
         let tenant_id_owned = tenant_id.to_string();
@@ -1334,7 +1334,7 @@ impl ControlPlane {
 
             let mut stmt = conn.prepare(
                 "SELECT id, tenant_id, name, role, created_at, revoked_at, last_used_at, expires_at
-                 FROM tenant_api_keys WHERE tenant_id = ?1 ORDER BY created_at DESC",
+                 FROM tenant_api_keys WHERE tenant_id = ?1 ORDER BY created_at DESC, id DESC",
             )?;
 
             let keys = stmt
@@ -1423,6 +1423,7 @@ impl ControlPlane {
 
     #[cfg(feature = "api-keys")]
     /// Flush pending last_used_at updates to the database.
+    #[allow(dead_code)] // Background task operation
     pub async fn flush_pending_updates(&self) -> Result<usize> {
         if self.pending_updates.is_empty() {
             return Ok(0);

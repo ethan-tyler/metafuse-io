@@ -61,6 +61,14 @@ use multi_tenant::{require_delete_permission, require_write_permission};
 #[cfg(feature = "api-keys")]
 use tenant_resolver::{ResolvedTenant, TenantResolverConfig};
 
+#[cfg(feature = "api-keys")]
+use control_plane::{
+    AuditContext as ControlPlaneAuditContext, AuditLogEntry, CreateTenantRequest, Tenant,
+    TenantApiKey, TenantRole, UpdateTenantRequest,
+};
+
+use axum::http::HeaderMap;
+
 /// Request ID for tracking requests through the system
 #[derive(Debug, Clone)]
 struct RequestId(String);
@@ -176,6 +184,117 @@ fn rbac_error(
             request_id: json.request_id.clone(),
         }),
     )
+}
+
+// =============================================================================
+// Admin API Types (requires api-keys feature)
+// =============================================================================
+
+/// Request to create a new API key for a tenant
+#[cfg(feature = "api-keys")]
+#[derive(Debug, Deserialize)]
+struct AdminCreateApiKeyRequest {
+    name: String,
+    role: TenantRole,
+    #[serde(default)]
+    expires_at: Option<String>,
+}
+
+/// Response when creating a tenant (includes initial API key)
+#[cfg(feature = "api-keys")]
+#[derive(Debug, Serialize)]
+struct AdminCreateTenantResponse {
+    tenant: Tenant,
+    /// Initial admin API key - only returned at creation time
+    initial_api_key: String,
+}
+
+/// Response when creating an API key
+#[cfg(feature = "api-keys")]
+#[derive(Debug, Serialize)]
+struct AdminCreateApiKeyResponse {
+    /// The API key - only returned at creation time
+    api_key: String,
+}
+
+/// Query parameters for audit log
+#[cfg(feature = "api-keys")]
+#[derive(Debug, Deserialize)]
+struct AdminAuditLogQuery {
+    tenant_id: Option<String>,
+    #[serde(default = "default_audit_limit")]
+    limit: usize,
+}
+
+#[cfg(feature = "api-keys")]
+fn default_audit_limit() -> usize {
+    100
+}
+
+/// Query parameters for listing tenants
+#[cfg(feature = "api-keys")]
+#[derive(Debug, Deserialize)]
+struct AdminListTenantsQuery {
+    status: Option<String>,
+}
+
+// =============================================================================
+// Admin Auth Middleware
+// =============================================================================
+
+/// Platform admin authorization middleware.
+/// Validates the METAFUSE_ADMIN_KEY environment variable.
+#[cfg(feature = "api-keys")]
+async fn require_admin_auth(
+    headers: HeaderMap,
+    Extension(request_id): Extension<RequestId>,
+    request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let admin_key = std::env::var("METAFUSE_ADMIN_KEY").map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Admin authentication not configured".to_string(),
+                request_id: request_id.0.clone(),
+            }),
+        )
+    })?;
+
+    let auth_header = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "Missing Authorization header".to_string(),
+                    request_id: request_id.0.clone(),
+                }),
+            )
+        })?;
+
+    let token = auth_header.strip_prefix("Bearer ").ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "Invalid Authorization format. Expected: Bearer <token>".to_string(),
+                request_id: request_id.0.clone(),
+            }),
+        )
+    })?;
+
+    if token != admin_key {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Invalid admin key".to_string(),
+                request_id: request_id.0.clone(),
+            }),
+        ));
+    }
+
+    Ok(next.run(request).await)
 }
 
 // =============================================================================
@@ -938,6 +1057,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Always run to make AuditContext available to handlers
     let app = app.layer(middleware::from_fn(audit_context_middleware));
 
+    // Add admin API routes (requires api-keys feature)
+    // These routes are protected by METAFUSE_ADMIN_KEY, NOT tenant API keys
+    #[cfg(feature = "api-keys")]
+    let app = {
+        use axum::routing::delete;
+
+        // Build admin router with dedicated admin auth
+        let admin_routes = Router::new()
+            .route(
+                "/tenants",
+                get(admin_list_tenants).post(admin_create_tenant),
+            )
+            .route(
+                "/tenants/:tenant_id",
+                get(admin_get_tenant)
+                    .put(admin_update_tenant)
+                    .delete(admin_delete_tenant),
+            )
+            .route("/tenants/:tenant_id/suspend", post(admin_suspend_tenant))
+            .route(
+                "/tenants/:tenant_id/reactivate",
+                post(admin_reactivate_tenant),
+            )
+            .route(
+                "/tenants/:tenant_id/api-keys",
+                get(admin_list_api_keys).post(admin_create_api_key),
+            )
+            .route(
+                "/tenants/:tenant_id/api-keys/:key_id",
+                delete(admin_revoke_api_key),
+            )
+            .route("/audit-log", get(admin_get_audit_log))
+            .layer(middleware::from_fn(require_admin_auth));
+
+        tracing::info!("Admin API routes enabled at /api/v1/admin/*");
+
+        // Merge admin routes into main app
+        app.nest("/api/v1/admin", admin_routes)
+    };
+
     // Add multi-tenant middleware if enabled (requires api-keys feature)
     #[cfg(feature = "api-keys")]
     let app = if mt_config.enabled {
@@ -1099,6 +1258,346 @@ fn extract_client_ip(req: &Request) -> Option<String> {
 async fn health_check() -> &'static str {
     "ok"
 }
+
+// =============================================================================
+// Admin API Handlers (requires api-keys feature)
+// =============================================================================
+
+/// List all tenants
+#[cfg(feature = "api-keys")]
+async fn admin_list_tenants(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Query(params): Query<AdminListTenantsQuery>,
+) -> Result<Json<Vec<Tenant>>, (StatusCode, Json<ErrorResponse>)> {
+    let control_plane = state.multi_tenant.control_plane().ok_or_else(|| {
+        internal_error(
+            "Control plane not available".to_string(),
+            request_id.0.clone(),
+        )
+    })?;
+
+    let tenants = control_plane
+        .list_tenants(params.status.as_deref())
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    Ok(Json(tenants))
+}
+
+/// Create a new tenant
+#[cfg(feature = "api-keys")]
+async fn admin_create_tenant(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(audit_ctx): Extension<AuditContext>,
+    Json(req): Json<CreateTenantRequest>,
+) -> Result<(StatusCode, Json<AdminCreateTenantResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let control_plane = state.multi_tenant.control_plane().ok_or_else(|| {
+        internal_error(
+            "Control plane not available".to_string(),
+            request_id.0.clone(),
+        )
+    })?;
+
+    let cp_audit = ControlPlaneAuditContext {
+        actor: "platform-admin".to_string(),
+        request_id: Some(request_id.0.clone()),
+        client_ip: audit_ctx.client_ip.clone(),
+    };
+
+    let (tenant, initial_api_key) =
+        control_plane
+            .create_tenant(req, cp_audit)
+            .await
+            .map_err(|e| {
+                if e.to_string().contains("already exists") {
+                    (
+                        StatusCode::CONFLICT,
+                        Json(ErrorResponse {
+                            error: e.to_string(),
+                            request_id: request_id.0.clone(),
+                        }),
+                    )
+                } else {
+                    internal_error(e.to_string(), request_id.0.clone())
+                }
+            })?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(AdminCreateTenantResponse {
+            tenant,
+            initial_api_key,
+        }),
+    ))
+}
+
+/// Get a specific tenant
+#[cfg(feature = "api-keys")]
+async fn admin_get_tenant(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<Tenant>, (StatusCode, Json<ErrorResponse>)> {
+    let control_plane = state.multi_tenant.control_plane().ok_or_else(|| {
+        internal_error(
+            "Control plane not available".to_string(),
+            request_id.0.clone(),
+        )
+    })?;
+
+    let tenant = control_plane
+        .get_tenant(&tenant_id)
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Tenant '{}' not found", tenant_id),
+                    request_id: request_id.0.clone(),
+                }),
+            )
+        })?;
+
+    Ok(Json(tenant))
+}
+
+/// Update a tenant
+#[cfg(feature = "api-keys")]
+async fn admin_update_tenant(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(audit_ctx): Extension<AuditContext>,
+    Path(tenant_id): Path<String>,
+    Json(req): Json<UpdateTenantRequest>,
+) -> Result<Json<Tenant>, (StatusCode, Json<ErrorResponse>)> {
+    let control_plane = state.multi_tenant.control_plane().ok_or_else(|| {
+        internal_error(
+            "Control plane not available".to_string(),
+            request_id.0.clone(),
+        )
+    })?;
+
+    let cp_audit = ControlPlaneAuditContext {
+        actor: "platform-admin".to_string(),
+        request_id: Some(request_id.0.clone()),
+        client_ip: audit_ctx.client_ip.clone(),
+    };
+
+    let tenant = control_plane
+        .update_tenant(&tenant_id, req, cp_audit)
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("not found") {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: e.to_string(),
+                        request_id: request_id.0.clone(),
+                    }),
+                )
+            } else {
+                internal_error(e.to_string(), request_id.0.clone())
+            }
+        })?;
+
+    Ok(Json(tenant))
+}
+
+/// Suspend a tenant
+#[cfg(feature = "api-keys")]
+async fn admin_suspend_tenant(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(audit_ctx): Extension<AuditContext>,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<Tenant>, (StatusCode, Json<ErrorResponse>)> {
+    let control_plane = state.multi_tenant.control_plane().ok_or_else(|| {
+        internal_error(
+            "Control plane not available".to_string(),
+            request_id.0.clone(),
+        )
+    })?;
+
+    let cp_audit = ControlPlaneAuditContext {
+        actor: "platform-admin".to_string(),
+        request_id: Some(request_id.0.clone()),
+        client_ip: audit_ctx.client_ip.clone(),
+    };
+
+    let tenant = control_plane
+        .suspend_tenant(&tenant_id, cp_audit)
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    Ok(Json(tenant))
+}
+
+/// Reactivate a suspended tenant
+#[cfg(feature = "api-keys")]
+async fn admin_reactivate_tenant(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(audit_ctx): Extension<AuditContext>,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<Tenant>, (StatusCode, Json<ErrorResponse>)> {
+    let control_plane = state.multi_tenant.control_plane().ok_or_else(|| {
+        internal_error(
+            "Control plane not available".to_string(),
+            request_id.0.clone(),
+        )
+    })?;
+
+    let cp_audit = ControlPlaneAuditContext {
+        actor: "platform-admin".to_string(),
+        request_id: Some(request_id.0.clone()),
+        client_ip: audit_ctx.client_ip.clone(),
+    };
+
+    let tenant = control_plane
+        .reactivate_tenant(&tenant_id, cp_audit)
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    Ok(Json(tenant))
+}
+
+/// Delete a tenant (soft delete)
+#[cfg(feature = "api-keys")]
+async fn admin_delete_tenant(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(audit_ctx): Extension<AuditContext>,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<Tenant>, (StatusCode, Json<ErrorResponse>)> {
+    let control_plane = state.multi_tenant.control_plane().ok_or_else(|| {
+        internal_error(
+            "Control plane not available".to_string(),
+            request_id.0.clone(),
+        )
+    })?;
+
+    let cp_audit = ControlPlaneAuditContext {
+        actor: "platform-admin".to_string(),
+        request_id: Some(request_id.0.clone()),
+        client_ip: audit_ctx.client_ip.clone(),
+    };
+
+    let tenant = control_plane
+        .delete_tenant(&tenant_id, cp_audit)
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    Ok(Json(tenant))
+}
+
+/// List API keys for a tenant
+#[cfg(feature = "api-keys")]
+async fn admin_list_api_keys(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<Vec<TenantApiKey>>, (StatusCode, Json<ErrorResponse>)> {
+    let control_plane = state.multi_tenant.control_plane().ok_or_else(|| {
+        internal_error(
+            "Control plane not available".to_string(),
+            request_id.0.clone(),
+        )
+    })?;
+
+    let keys = control_plane
+        .list_tenant_api_keys(&tenant_id)
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    Ok(Json(keys))
+}
+
+/// Create a new API key for a tenant
+#[cfg(feature = "api-keys")]
+async fn admin_create_api_key(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(tenant_id): Path<String>,
+    Json(req): Json<AdminCreateApiKeyRequest>,
+) -> Result<(StatusCode, Json<AdminCreateApiKeyResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let control_plane = state.multi_tenant.control_plane().ok_or_else(|| {
+        internal_error(
+            "Control plane not available".to_string(),
+            request_id.0.clone(),
+        )
+    })?;
+
+    let api_key = control_plane
+        .create_tenant_api_key(&tenant_id, req.name, req.role, req.expires_at)
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(AdminCreateApiKeyResponse { api_key }),
+    ))
+}
+
+/// Revoke an API key
+#[cfg(feature = "api-keys")]
+async fn admin_revoke_api_key(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path((tenant_id, key_id)): Path<(String, i64)>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let control_plane = state.multi_tenant.control_plane().ok_or_else(|| {
+        internal_error(
+            "Control plane not available".to_string(),
+            request_id.0.clone(),
+        )
+    })?;
+
+    let revoked = control_plane
+        .revoke_tenant_api_key(&tenant_id, key_id)
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    if revoked {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("API key {} not found for tenant {}", key_id, tenant_id),
+                request_id: request_id.0.clone(),
+            }),
+        ))
+    }
+}
+
+/// Get audit log
+#[cfg(feature = "api-keys")]
+async fn admin_get_audit_log(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Query(params): Query<AdminAuditLogQuery>,
+) -> Result<Json<Vec<AuditLogEntry>>, (StatusCode, Json<ErrorResponse>)> {
+    let control_plane = state.multi_tenant.control_plane().ok_or_else(|| {
+        internal_error(
+            "Control plane not available".to_string(),
+            request_id.0.clone(),
+        )
+    })?;
+
+    let logs = control_plane
+        .get_audit_log(params.tenant_id.as_deref(), params.limit)
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    Ok(Json(logs))
+}
+
+// =============================================================================
+// Dataset Handlers
+// =============================================================================
 
 /// List all datasets
 async fn list_datasets(
