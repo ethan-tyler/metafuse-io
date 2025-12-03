@@ -48,6 +48,14 @@
 //! - `contracts_checks_total` - Counter for contract validations by result
 //! - `contracts_violations_total` - Counter for contract violations by type and action
 //!
+//! ## Column-Level Lineage Metrics (v0.10.0)
+//!
+//! - `lineage_operations_total` - Counter for lineage operations (parse, record, delete) by status
+//! - `lineage_queries_total` - Counter for lineage queries (upstream, downstream, pii_propagation, impact)
+//! - `lineage_query_duration_seconds` - Histogram for lineage query latency
+//! - `lineage_edges_total` - Gauge for total lineage edges in the catalog
+//! - `lineage_transformations_total` - Counter for lineage edges by transformation type
+//!
 //! ## Cardinality Control
 //!
 //! Per-tenant metrics (those with `tenant_id` label) create a new Prometheus time series
@@ -323,6 +331,53 @@ lazy_static! {
         "contracts_violations_total",
         "Total contract violations detected",
         &["contract_type", "on_violation"]
+    )
+    .unwrap();
+
+    // ==========================================================================
+    // Column-Level Lineage Metrics (v0.10.0)
+    // ==========================================================================
+
+    /// Counter for lineage operations (parse, record, delete)
+    /// Labels: operation (parse, record, delete), status (success, error)
+    pub static ref LINEAGE_OPERATIONS_TOTAL: CounterVec = register_counter_vec!(
+        "lineage_operations_total",
+        "Total column-level lineage operations",
+        &["operation", "status"]
+    )
+    .unwrap();
+
+    /// Counter for lineage queries
+    /// Labels: query_type (upstream, downstream, pii_propagation, impact)
+    pub static ref LINEAGE_QUERIES_TOTAL: CounterVec = register_counter_vec!(
+        "lineage_queries_total",
+        "Total lineage graph queries",
+        &["query_type", "status"]
+    )
+    .unwrap();
+
+    /// Histogram for lineage query duration in seconds
+    pub static ref LINEAGE_QUERY_DURATION_SECONDS: HistogramVec = register_histogram_vec!(
+        "lineage_query_duration_seconds",
+        "Lineage query latency in seconds",
+        &["query_type"],
+        vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+    )
+    .unwrap();
+
+    /// Gauge for total lineage edges in the catalog
+    pub static ref LINEAGE_EDGES_TOTAL: Gauge = register_gauge!(
+        "lineage_edges_total",
+        "Total number of column-level lineage edges in the catalog"
+    )
+    .unwrap();
+
+    /// Counter for lineage parse results by transformation type
+    /// Labels: transformation_type (Direct, Expression, Aggregate, Window, Case, Cast)
+    pub static ref LINEAGE_TRANSFORMATIONS_TOTAL: CounterVec = register_counter_vec!(
+        "lineage_transformations_total",
+        "Lineage edges by transformation type",
+        &["transformation_type"]
     )
     .unwrap();
 }
@@ -849,4 +904,91 @@ pub fn record_contract_pass(contract_type: &str) {
 /// Convenience: record a failing contract check
 pub fn record_contract_fail(contract_type: &str) {
     record_contract_check("fail", contract_type);
+}
+
+// =============================================================================
+// Column-Level Lineage Metrics Helper Functions (v0.10.0)
+// =============================================================================
+
+/// Record a lineage operation (parse, record, delete)
+pub fn record_lineage_operation(operation: &str, status: &str) {
+    LINEAGE_OPERATIONS_TOTAL
+        .with_label_values(&[operation, status])
+        .inc();
+}
+
+/// Record a successful lineage operation
+pub fn record_lineage_operation_success(operation: &str) {
+    record_lineage_operation(operation, "success");
+}
+
+/// Record a failed lineage operation
+pub fn record_lineage_operation_error(operation: &str) {
+    record_lineage_operation(operation, "error");
+}
+
+/// Record a lineage query
+pub fn record_lineage_query(query_type: &str, status: &str) {
+    LINEAGE_QUERIES_TOTAL
+        .with_label_values(&[query_type, status])
+        .inc();
+}
+
+/// Record lineage query duration
+pub fn record_lineage_query_duration(query_type: &str, duration_secs: f64) {
+    LINEAGE_QUERY_DURATION_SECONDS
+        .with_label_values(&[query_type])
+        .observe(duration_secs);
+}
+
+/// Update the total lineage edges gauge
+pub fn update_lineage_edges_total(count: i64) {
+    LINEAGE_EDGES_TOTAL.set(count as f64);
+}
+
+/// Record lineage transformation type
+pub fn record_lineage_transformation(transformation_type: &str) {
+    LINEAGE_TRANSFORMATIONS_TOTAL
+        .with_label_values(&[transformation_type])
+        .inc();
+}
+
+/// Convenience: record successful upstream lineage query
+pub fn record_upstream_lineage_query_success() {
+    record_lineage_query("upstream", "success");
+}
+
+/// Convenience: record successful downstream lineage query
+pub fn record_downstream_lineage_query_success() {
+    record_lineage_query("downstream", "success");
+}
+
+/// Convenience: record successful PII propagation query
+pub fn record_pii_propagation_query_success() {
+    record_lineage_query("pii_propagation", "success");
+}
+
+/// Convenience: record successful impact analysis query
+pub fn record_impact_analysis_query_success() {
+    record_lineage_query("impact", "success");
+}
+
+/// Convenience: record successful lineage parse
+pub fn record_lineage_parse_success() {
+    record_lineage_operation_success("parse");
+}
+
+/// Convenience: record failed lineage parse
+pub fn record_lineage_parse_error() {
+    record_lineage_operation_error("parse");
+}
+
+/// Convenience: record successful lineage record
+pub fn record_lineage_record_success() {
+    record_lineage_operation_success("record");
+}
+
+/// Convenience: record successful lineage delete
+pub fn record_lineage_delete_success() {
+    record_lineage_operation_success("delete");
 }

@@ -7,6 +7,7 @@ members = [
     "crates/catalog-api",
     "crates/catalog-cli",
     "crates/catalog-client",
+    "crates/catalog-lineage",
 ]
 
 resolver = "2"

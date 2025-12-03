@@ -7,6 +7,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2025-12-02
+
+### Column-Level Lineage Release
+
+This release introduces column-level data lineage tracking, enabling precise tracking of how data flows from source columns to target columns through SQL transformations. Essential for PII propagation tracking, impact analysis, and regulatory compliance.
+
+#### Added
+
+- **Column-Level Lineage Parser** (`catalog-lineage` crate)
+  - SQL parsing using `sqlparser-rs` v0.52 (GenericDialect)
+  - Extracts column-to-column lineage edges from SELECT statements
+  - Supports direct columns, aliases, qualified names (table.column)
+  - Binary expression handling (arithmetic, comparisons)
+  - Aggregate function detection (SUM, COUNT, AVG, etc.)
+  - CASE expression handling with all referenced columns
+  - CAST/TryCast transformation detection
+  - Window function support with partition/order columns
+  - JOIN support (INNER, LEFT, RIGHT, FULL)
+  - CREATE TABLE AS SELECT (CTAS) extraction
+  - Best-effort parsing: logs warnings for unsupported SQL, doesn't block
+
+- **Transformation Types**
+  - `Direct` - Column passes through unchanged
+  - `Expression` - Column modified by arithmetic/string operations
+  - `Aggregate` - Column used in aggregation function
+  - `Window` - Column used in window function
+  - `Case` - Column referenced in CASE expression
+  - `Cast` - Column type converted
+
+- **API Endpoints** (feature-gated: `column-lineage`)
+  - `POST /api/v1/lineage/parse` - Parse SQL and extract lineage
+  - `POST /api/v1/lineage/edges` - Record lineage edges
+  - `GET /api/v1/lineage/dataset/:id/columns/:column/upstream` - Get upstream lineage (recursive)
+  - `GET /api/v1/lineage/dataset/:id/columns/:column/downstream` - Get downstream lineage (recursive)
+  - `GET /api/v1/lineage/dataset/:id/columns/:column/pii-propagation` - Track PII propagation
+  - `GET /api/v1/lineage/fields/:id/impact` - Impact analysis for field changes
+  - `DELETE /api/v1/lineage/dataset/:id` - Delete lineage edges for refresh
+
+- **PII Propagation Tracking**
+  - Traces where PII data flows downstream
+  - Flags transformations that may anonymize data
+  - Detects aggregations, hashing (MD5, SHA), masking, truncation, rounding
+  - Enables compliance auditing for GDPR/CCPA
+
+- **Impact Analysis**
+  - Field-level change impact assessment
+  - Severity ratings: high (direct), medium (derived), low (distant)
+  - Summary statistics: affected columns, datasets, max depth
+  - Recursive traversal with configurable max_depth
+
+- **Prometheus Metrics**
+  - `lineage_operations_total` - Counter for parse/record/delete operations
+  - `lineage_queries_total` - Counter for upstream/downstream/pii/impact queries
+  - `lineage_query_duration_seconds` - Histogram for query latency
+  - `lineage_edges_total` - Gauge for total lineage edges
+  - `lineage_transformations_total` - Counter by transformation type
+
+- **Feature Flags**
+  - `column-lineage` - Enable column-level lineage module and endpoints
+  - Included in `production` feature bundle
+
+#### Database Migrations
+
+- **v1.6.0**: Add `column_lineage` table
+  - Hybrid field references (field_id + field_name) for resilience
+  - Source and target dataset/field tracking
+  - Transformation type and expression storage
+  - CASCADE delete when datasets are removed
+  - Indexes for forward lineage (source -> target)
+  - Indexes for backward lineage (target -> source)
+  - Indexes for field_id lookups (when available)
+  - Index for transformation type queries
+
+#### SQL Support Matrix
+
+| Feature | Support |
+|---------|---------|
+| SELECT columns | Full |
+| Column aliases | Full |
+| Qualified columns (t.col) | Full |
+| Binary expressions | Full |
+| Aggregate functions | Full |
+| CASE expressions | Full |
+| CAST/TryCast | Full |
+| JOINs | Full |
+| Window functions | Full |
+| Subqueries | Partial |
+| CTEs (WITH) | Partial |
+| SELECT * | Limited (requires schema) |
+
+#### Testing
+
+- 11 new lineage-specific tests
+  - SQL parsing tests (simple, aggregate, joins, case expressions)
+  - DTO conversion tests
+  - Recursive lineage traversal tests (upstream/downstream)
+  - PII anonymization detection tests
+  - Impact analysis severity tests
+  - Delete lineage tests
+- Integration with existing test infrastructure
+
+#### Migration Notes
+
+- **Database migrations required**: v1.6.0 runs automatically
+- **Feature flag**: Enable with `--features column-lineage` or `--features production`
+- **No breaking changes**: Lineage is additive; existing functionality unchanged
+- **Recommended**: Parse and record lineage when datasets are created/updated
+
+---
+
 ## [0.9.0] - 2025-12-02
 
 ### Alerting & Data Contracts Release

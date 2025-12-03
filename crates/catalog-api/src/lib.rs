@@ -42,6 +42,10 @@ pub mod alerting;
 #[cfg(feature = "contracts")]
 pub mod contracts;
 
+// v0.10.0: Column-Level Lineage
+#[cfg(feature = "column-lineage")]
+pub mod lineage;
+
 // Test utilities (feature-gated)
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;

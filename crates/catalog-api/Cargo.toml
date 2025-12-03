@@ -26,10 +26,12 @@ quota-enforcement = ["api-keys"]
 # v0.9.0: Alerting and Data Contracts
 alerting = ["reqwest", "rand"]
 contracts = []
+# v0.10.0: Column-Level Lineage
+column-lineage = []
 # Enterprise bundle (all enterprise features)
 enterprise = ["audit", "usage-analytics", "classification"]
-# Production bundle (enterprise + security + quotas + alerting + contracts)
-production = ["enterprise", "rate-limiting", "api-keys", "metrics", "quota-enforcement", "alerting", "contracts"]
+# Production bundle (enterprise + security + quotas + alerting + contracts + lineage)
+production = ["enterprise", "rate-limiting", "api-keys", "metrics", "quota-enforcement", "alerting", "contracts", "column-lineage"]
 # Test utilities for integration tests
 test-utils = ["tempfile"]
 
@@ -37,6 +39,7 @@ test-utils = ["tempfile"]
 metafuse-catalog-core = { path = "../catalog-core" }
 metafuse-catalog-storage = { path = "../catalog-storage" }
 metafuse-catalog-delta = { path = "../catalog-delta" }
+metafuse-catalog-lineage = { path = "../catalog-lineage" }
 
 axum.workspace = true
 tokio.workspace = true

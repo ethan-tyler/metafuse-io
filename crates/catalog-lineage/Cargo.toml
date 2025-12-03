@@ -1,0 +1,26 @@
+[package]
+name = "metafuse-catalog-lineage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Column-level lineage extraction for MetaFuse catalog - parse SQL to track column transformations"
+
+[dependencies]
+# SQL parsing
+sqlparser = "0.52"
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Tracing
+tracing = { workspace = true }
+
+[dev-dependencies]
+# For testing
+pretty_assertions = "1"

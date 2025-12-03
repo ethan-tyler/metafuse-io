@@ -37,6 +37,9 @@ use metafuse_catalog_api::alerting;
 #[cfg(feature = "contracts")]
 use metafuse_catalog_api::contracts;
 
+#[cfg(feature = "column-lineage")]
+use metafuse_catalog_api::lineage;
+
 use axum::{
     extract::{Extension, Path, Query, Request, State},
     http::{header, HeaderValue, StatusCode},
@@ -1091,6 +1094,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .put(update_contract)
                 .delete(delete_contract),
         );
+
+    // Column-level lineage endpoints (v0.10.0)
+    #[cfg(feature = "column-lineage")]
+    let app = {
+        tracing::info!("Column-level lineage API enabled at /api/v1/lineage/*");
+        app.route("/api/v1/lineage/parse", post(lineage_parse))
+            .route("/api/v1/lineage/edges", post(lineage_record))
+            .route(
+                "/api/v1/lineage/dataset/:dataset_id/columns/:column/upstream",
+                get(lineage_upstream),
+            )
+            .route(
+                "/api/v1/lineage/dataset/:dataset_id/columns/:column/downstream",
+                get(lineage_downstream),
+            )
+            .route(
+                "/api/v1/lineage/dataset/:dataset_id/columns/:column/pii-propagation",
+                get(lineage_pii_propagation),
+            )
+            .route(
+                "/api/v1/lineage/dataset/:dataset_id",
+                axum::routing::delete(lineage_delete_dataset),
+            )
+            .route(
+                "/api/v1/lineage/fields/:field_id/impact",
+                get(lineage_field_impact),
+            )
+    };
 
     // Add metrics endpoint if metrics feature is enabled
     #[cfg(feature = "metrics")]
@@ -7153,6 +7184,296 @@ async fn delete_contract(
 struct ContractDeletedResponse {
     name: String,
     message: String,
+}
+
+// =============================================================================
+// Column-Level Lineage Endpoints (v0.10.0)
+// =============================================================================
+
+/// Parse SQL and extract column lineage
+#[cfg(feature = "column-lineage")]
+async fn lineage_parse(
+    Json(request): Json<lineage::ParseLineageRequest>,
+) -> Result<Json<lineage::ParseLineageResponse>, (StatusCode, String)> {
+    use metafuse_catalog_lineage::ColumnLineageParser;
+
+    let parser = ColumnLineageParser::new();
+    match parser.parse_lineage(&request.sql, &request.target_dataset) {
+        Ok(result) => Ok(Json(lineage::ParseLineageResponse::from(result))),
+        Err(e) => Err((StatusCode::BAD_REQUEST, format!("Parse error: {}", e))),
+    }
+}
+
+/// Record lineage edges in the database
+#[cfg(feature = "column-lineage")]
+async fn lineage_record(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
+    Json(request): Json<lineage::RecordLineageRequest>,
+) -> Result<Json<lineage::RecordLineageResponse>, (StatusCode, String)> {
+    // Check write permission in multi-tenant mode
+    #[cfg(feature = "api-keys")]
+    require_write_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(|e| (e.0, e.1.error.clone()))?;
+
+    // Input validation: dataset IDs must be positive
+    if request.source_dataset_id <= 0 || request.target_dataset_id <= 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Dataset IDs must be positive integers".to_string(),
+        ));
+    }
+
+    // Input validation: limit number of edges per request
+    const MAX_EDGES_PER_REQUEST: usize = 1000;
+    if request.edges.len() > MAX_EDGES_PER_REQUEST {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Maximum {} edges per request", MAX_EDGES_PER_REQUEST),
+        ));
+    }
+
+    // Input validation: column names
+    for edge in &request.edges {
+        if edge.source_column.is_empty() || edge.target_column.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Column names cannot be empty".to_string(),
+            ));
+        }
+        if edge.source_column.len() > 256 || edge.target_column.len() > 256 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Column names cannot exceed 256 characters".to_string(),
+            ));
+        }
+    }
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend.get_connection().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database connection error: {}", e),
+        )
+    })?;
+
+    let mut edges_recorded = 0;
+    for edge in &request.edges {
+        conn.execute(
+            "INSERT INTO column_lineage (source_dataset_id, source_field_name, target_dataset_id, target_field_name, transformation_type, expression)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                request.source_dataset_id,
+                edge.source_column,
+                request.target_dataset_id,
+                edge.target_column,
+                edge.transformation_type,
+                edge.expression
+            ],
+        ).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            )
+        })?;
+        edges_recorded += 1;
+    }
+
+    #[cfg(feature = "metrics")]
+    metrics::record_lineage_operation("record", "success");
+
+    Ok(Json(lineage::RecordLineageResponse { edges_recorded }))
+}
+
+/// Maximum recursion depth for lineage traversal
+#[cfg(feature = "column-lineage")]
+const MAX_LINEAGE_DEPTH: i32 = 50;
+
+/// Validate and clamp lineage lookup parameters
+#[cfg(feature = "column-lineage")]
+fn validate_lineage_params(
+    dataset_id: i64,
+    column: &str,
+    params: &lineage::LineageLookupParams,
+) -> Result<lineage::LineageLookupParams, (StatusCode, String)> {
+    // Dataset ID must be positive
+    if dataset_id <= 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Dataset ID must be a positive integer".to_string(),
+        ));
+    }
+
+    // Column name validation
+    if column.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Column name cannot be empty".to_string(),
+        ));
+    }
+    if column.len() > 256 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Column name cannot exceed 256 characters".to_string(),
+        ));
+    }
+
+    // Clamp max_depth to prevent excessive recursion
+    let clamped_depth = params.max_depth.clamp(1, MAX_LINEAGE_DEPTH);
+
+    Ok(lineage::LineageLookupParams {
+        max_depth: clamped_depth,
+    })
+}
+
+/// Get upstream lineage for a column
+#[cfg(feature = "column-lineage")]
+async fn lineage_upstream(
+    State(state): State<AppState>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    Path((dataset_id, column)): Path<(i64, String)>,
+    Query(params): Query<lineage::LineageLookupParams>,
+) -> Result<Json<lineage::LineageLookupResponse>, (StatusCode, String)> {
+    // Validate and clamp parameters
+    let validated_params = validate_lineage_params(dataset_id, &column, &params)?;
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let lineage_state = lineage::LineageAppState { backend };
+
+    #[cfg(feature = "metrics")]
+    metrics::record_lineage_query("upstream", "success");
+
+    lineage::get_upstream_lineage(
+        State(lineage_state),
+        Path((dataset_id, column)),
+        Query(validated_params),
+    )
+    .await
+}
+
+/// Get downstream lineage for a column
+#[cfg(feature = "column-lineage")]
+async fn lineage_downstream(
+    State(state): State<AppState>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    Path((dataset_id, column)): Path<(i64, String)>,
+    Query(params): Query<lineage::LineageLookupParams>,
+) -> Result<Json<lineage::LineageLookupResponse>, (StatusCode, String)> {
+    // Validate and clamp parameters
+    let validated_params = validate_lineage_params(dataset_id, &column, &params)?;
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let lineage_state = lineage::LineageAppState { backend };
+
+    #[cfg(feature = "metrics")]
+    metrics::record_lineage_query("downstream", "success");
+
+    lineage::get_downstream_lineage(
+        State(lineage_state),
+        Path((dataset_id, column)),
+        Query(validated_params),
+    )
+    .await
+}
+
+/// Get PII propagation for a column
+#[cfg(feature = "column-lineage")]
+async fn lineage_pii_propagation(
+    State(state): State<AppState>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    Path((dataset_id, column)): Path<(i64, String)>,
+    Query(params): Query<lineage::LineageLookupParams>,
+) -> Result<Json<lineage::PiiPropagationResponse>, (StatusCode, String)> {
+    // Validate and clamp parameters
+    let validated_params = validate_lineage_params(dataset_id, &column, &params)?;
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let lineage_state = lineage::LineageAppState { backend };
+
+    #[cfg(feature = "metrics")]
+    metrics::record_lineage_query("pii_propagation", "success");
+
+    lineage::get_pii_propagation(
+        State(lineage_state),
+        Path((dataset_id, column)),
+        Query(validated_params),
+    )
+    .await
+}
+
+/// Delete lineage edges for a dataset
+#[cfg(feature = "column-lineage")]
+async fn lineage_delete_dataset(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
+    Path(dataset_id): Path<i64>,
+) -> Result<Json<lineage::DeleteLineageResponse>, (StatusCode, String)> {
+    // Check delete permission in multi-tenant mode (requires Admin role)
+    #[cfg(feature = "api-keys")]
+    require_delete_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(|e| (e.0, e.1.error.clone()))?;
+
+    // Input validation
+    if dataset_id <= 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Dataset ID must be a positive integer".to_string(),
+        ));
+    }
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let lineage_state = lineage::LineageAppState { backend };
+
+    let result = lineage::delete_dataset_lineage(State(lineage_state), Path(dataset_id)).await;
+
+    #[cfg(feature = "metrics")]
+    if result.is_ok() {
+        metrics::record_lineage_operation("delete", "success");
+    } else {
+        metrics::record_lineage_operation("delete", "error");
+    }
+
+    result
+}
+
+/// Get impact analysis for a field change
+#[cfg(feature = "column-lineage")]
+async fn lineage_field_impact(
+    State(state): State<AppState>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    Path(field_id): Path<i64>,
+    Query(params): Query<lineage::LineageLookupParams>,
+) -> Result<Json<lineage::ImpactAnalysisResponse>, (StatusCode, String)> {
+    // Input validation
+    if field_id <= 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Field ID must be a positive integer".to_string(),
+        ));
+    }
+
+    // Clamp max_depth
+    let clamped_depth = params.max_depth.clamp(1, MAX_LINEAGE_DEPTH);
+    let validated_params = lineage::LineageLookupParams {
+        max_depth: clamped_depth,
+    };
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let lineage_state = lineage::LineageAppState { backend };
+
+    #[cfg(feature = "metrics")]
+    metrics::record_lineage_query("impact_analysis", "success");
+
+    lineage::get_field_impact(
+        State(lineage_state),
+        Path(field_id),
+        Query(validated_params),
+    )
+    .await
 }
 
 // =============================================================================

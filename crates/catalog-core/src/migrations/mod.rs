@@ -45,6 +45,7 @@ mod v1_3_0;
 mod v1_4_0;
 mod v1_5_0;
 mod v1_5_1;
+mod v1_6_0;
 
 /// Migration version number.
 pub type MigrationVersion = i64;
@@ -73,6 +74,7 @@ pub fn all_migrations() -> Vec<Migration> {
         v1_4_0::migration(),
         v1_5_0::migration(),
         v1_5_1::migration(),
+        v1_6_0::migration(),
     ]
 }
 
