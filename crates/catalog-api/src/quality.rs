@@ -646,6 +646,637 @@ pub fn get_unhealthy_datasets(
 }
 
 // =============================================================================
+// Quality Check Executor (v1.7.0)
+// =============================================================================
+
+use metafuse_catalog_core::{
+    QualityCheck, QualityCheckExecutionMode, QualityCheckResult, QualityCheckSeverity,
+    QualityCheckStatus, QualityCheckType,
+};
+
+/// Request to create a new quality check
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct CreateQualityCheckRequest {
+    pub check_type: String,
+    pub check_name: String,
+    #[serde(default)]
+    pub check_description: Option<String>,
+    #[serde(default)]
+    pub check_config: Option<String>,
+    #[serde(default = "default_severity")]
+    pub severity: String,
+    #[serde(default)]
+    pub warn_threshold: Option<f64>,
+    #[serde(default)]
+    pub fail_threshold: Option<f64>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub schedule: Option<String>,
+    #[serde(default = "default_true")]
+    pub on_demand: bool,
+}
+
+fn default_severity() -> String {
+    "warning".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Response from quality check execution
+#[derive(Debug, Clone, Serialize)]
+pub struct QualityCheckExecutionResponse {
+    pub check_id: String,
+    pub check_name: String,
+    pub dataset_id: i64,
+    pub status: String,
+    pub score: Option<f64>,
+    pub details: Option<String>,
+    pub records_checked: Option<i64>,
+    pub records_failed: Option<i64>,
+    pub execution_time_ms: i64,
+    pub executed_at: String,
+}
+
+/// Executor for quality checks
+pub struct QualityCheckExecutor {
+    delta_reader: std::sync::Arc<metafuse_catalog_delta::DeltaReader>,
+}
+
+impl QualityCheckExecutor {
+    /// Create a new quality check executor
+    pub fn new(delta_reader: std::sync::Arc<metafuse_catalog_delta::DeltaReader>) -> Self {
+        Self { delta_reader }
+    }
+
+    /// Execute a single quality check
+    pub async fn execute_check(
+        &self,
+        conn: &rusqlite::Connection,
+        check: &QualityCheck,
+        delta_location: Option<&str>,
+        mode: QualityCheckExecutionMode,
+    ) -> Result<QualityCheckResult, QualityError> {
+        let start = std::time::Instant::now();
+        let result_id = uuid::Uuid::new_v4().to_string();
+
+        info!(
+            check_id = %check.id,
+            check_type = %check.check_type,
+            check_name = %check.check_name,
+            "Executing quality check"
+        );
+
+        let result = match check.check_type {
+            QualityCheckType::Completeness => {
+                self.execute_completeness_check(conn, check, delta_location)
+                    .await
+            }
+            QualityCheckType::Freshness => {
+                self.execute_freshness_check(conn, check, delta_location)
+                    .await
+            }
+            QualityCheckType::Validity => {
+                // Validity checks require custom SQL in check_config
+                self.execute_custom_check(conn, check).await
+            }
+            QualityCheckType::Uniqueness => {
+                self.execute_uniqueness_check(conn, check, delta_location)
+                    .await
+            }
+            QualityCheckType::Custom => self.execute_custom_check(conn, check).await,
+        };
+
+        let execution_time_ms = start.elapsed().as_millis() as i64;
+
+        match result {
+            Ok((score, details, records_checked, records_failed)) => {
+                let status = self.determine_status_from_score(score, check);
+                Ok(QualityCheckResult {
+                    id: result_id,
+                    check_id: check.id.clone(),
+                    dataset_id: check.dataset_id,
+                    status,
+                    score: Some(score),
+                    details,
+                    error_message: None,
+                    records_checked: Some(records_checked),
+                    records_failed: Some(records_failed),
+                    executed_at: chrono::Utc::now(),
+                    execution_time_ms: Some(execution_time_ms),
+                    execution_mode: mode,
+                    delta_version: None,
+                })
+            }
+            Err(e) => Ok(QualityCheckResult {
+                id: result_id,
+                check_id: check.id.clone(),
+                dataset_id: check.dataset_id,
+                status: QualityCheckStatus::Error,
+                score: None,
+                details: None,
+                error_message: Some(e.to_string()),
+                records_checked: None,
+                records_failed: None,
+                executed_at: chrono::Utc::now(),
+                execution_time_ms: Some(execution_time_ms),
+                execution_mode: mode,
+                delta_version: None,
+            }),
+        }
+    }
+
+    /// Execute a completeness check (null count analysis)
+    async fn execute_completeness_check(
+        &self,
+        conn: &rusqlite::Connection,
+        check: &QualityCheck,
+        delta_location: Option<&str>,
+    ) -> Result<(f64, Option<String>, i64, i64), QualityError> {
+        // Get Delta metadata if available
+        if let Some(location) = delta_location {
+            let metadata = self
+                .delta_reader
+                .get_metadata_cached(location)
+                .await
+                .map_err(|e| QualityError::DeltaError(e.to_string()))?;
+
+            let row_count = metadata.row_count;
+            let column_count = metadata.schema.fields.len() as i64;
+
+            if row_count == 0 || column_count == 0 {
+                return Ok((1.0, Some(r#"{"status":"empty_table"}"#.to_string()), 0, 0));
+            }
+
+            let total_nulls: i64 = metadata
+                .column_stats
+                .iter()
+                .filter_map(|s| s.null_count)
+                .sum();
+
+            let total_cells = row_count * column_count;
+            let null_ratio = total_nulls as f64 / total_cells as f64;
+            let score = clamp_score(1.0 - null_ratio);
+
+            let details = serde_json::json!({
+                "row_count": row_count,
+                "column_count": column_count,
+                "total_cells": total_cells,
+                "null_cells": total_nulls,
+                "null_ratio": null_ratio,
+            });
+
+            Ok((score, Some(details.to_string()), total_cells, total_nulls))
+        } else {
+            // Fall back to stored field count
+            let field_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM fields WHERE dataset_id = ?1",
+                    [check.dataset_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+
+            let row_count: Option<i64> = conn
+                .query_row(
+                    "SELECT row_count FROM datasets WHERE id = ?1",
+                    [check.dataset_id],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
+
+            match row_count {
+                Some(rows) if rows > 0 && field_count > 0 => {
+                    // Without Delta stats, assume 100% completeness
+                    Ok((
+                        1.0,
+                        Some(r#"{"status":"no_null_stats"}"#.to_string()),
+                        rows * field_count,
+                        0,
+                    ))
+                }
+                _ => Ok((1.0, Some(r#"{"status":"no_data"}"#.to_string()), 0, 0)),
+            }
+        }
+    }
+
+    /// Execute a freshness check
+    async fn execute_freshness_check(
+        &self,
+        conn: &rusqlite::Connection,
+        check: &QualityCheck,
+        delta_location: Option<&str>,
+    ) -> Result<(f64, Option<String>, i64, i64), QualityError> {
+        // Get freshness config
+        let config: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT expected_interval_secs, grace_period_secs FROM freshness_config WHERE dataset_id = ?1",
+                [check.dataset_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+
+        let (expected_interval, grace_period) = config.ok_or(QualityError::NoFreshnessConfig)?;
+
+        // Get last modified
+        let last_modified = if let Some(location) = delta_location {
+            let metadata = self
+                .delta_reader
+                .get_metadata_cached(location)
+                .await
+                .map_err(|e| QualityError::DeltaError(e.to_string()))?;
+            metadata.last_modified
+        } else {
+            // Fall back to dataset's last_updated
+            let last_updated: String = conn
+                .query_row(
+                    "SELECT last_updated FROM datasets WHERE id = ?1",
+                    [check.dataset_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+            chrono::DateTime::parse_from_rfc3339(&last_updated)
+                .map_err(|_| QualityError::NoLastModified)?
+                .with_timezone(&chrono::Utc)
+        };
+
+        let now = chrono::Utc::now();
+        let staleness_secs = (now - last_modified).num_seconds();
+        let threshold_secs = expected_interval + grace_period;
+
+        let score = if staleness_secs <= threshold_secs {
+            1.0
+        } else {
+            let extra_staleness = staleness_secs - threshold_secs;
+            let periods_overdue = extra_staleness as f64 / expected_interval as f64;
+            clamp_score(1.0 / (1.0 + periods_overdue))
+        };
+
+        let details = serde_json::json!({
+            "last_modified": last_modified.to_rfc3339(),
+            "staleness_secs": staleness_secs,
+            "expected_interval_secs": expected_interval,
+            "grace_period_secs": grace_period,
+            "threshold_secs": threshold_secs,
+        });
+
+        // Freshness is a pass/fail - 1 check, 0 or 1 failed
+        let failed = if score < 1.0 { 1 } else { 0 };
+        Ok((score, Some(details.to_string()), 1, failed))
+    }
+
+    /// Execute a uniqueness check
+    async fn execute_uniqueness_check(
+        &self,
+        _conn: &rusqlite::Connection,
+        check: &QualityCheck,
+        _delta_location: Option<&str>,
+    ) -> Result<(f64, Option<String>, i64, i64), QualityError> {
+        // Uniqueness checks require data scanning which we don't do in the catalog
+        // Return a placeholder result indicating the check needs external execution
+        let details = serde_json::json!({
+            "status": "requires_external_execution",
+            "message": "Uniqueness checks require external data scanning",
+            "check_config": check.check_config,
+        });
+        Ok((1.0, Some(details.to_string()), 0, 0))
+    }
+
+    /// Execute a custom SQL-based check
+    async fn execute_custom_check(
+        &self,
+        _conn: &rusqlite::Connection,
+        check: &QualityCheck,
+    ) -> Result<(f64, Option<String>, i64, i64), QualityError> {
+        // Custom checks require external execution (e.g., via DataFusion)
+        let details = serde_json::json!({
+            "status": "requires_external_execution",
+            "message": "Custom checks require external SQL execution",
+            "check_config": check.check_config,
+        });
+        Ok((1.0, Some(details.to_string()), 0, 0))
+    }
+
+    /// Determine status based on score and thresholds
+    pub fn determine_status_from_score(
+        &self,
+        score: f64,
+        check: &QualityCheck,
+    ) -> QualityCheckStatus {
+        if let Some(fail_threshold) = check.fail_threshold {
+            if score < fail_threshold {
+                return QualityCheckStatus::Fail;
+            }
+        }
+        if let Some(warn_threshold) = check.warn_threshold {
+            if score < warn_threshold {
+                return QualityCheckStatus::Warn;
+            }
+        }
+        QualityCheckStatus::Pass
+    }
+}
+
+// =============================================================================
+// Quality Check Database Operations
+// =============================================================================
+
+/// Create a new quality check
+pub fn create_quality_check(
+    conn: &rusqlite::Connection,
+    dataset_id: i64,
+    request: &CreateQualityCheckRequest,
+    created_by: Option<&str>,
+    tenant_id: Option<&str>,
+) -> Result<QualityCheck, QualityError> {
+    let check_id = uuid::Uuid::new_v4().to_string();
+    let check_type: QualityCheckType =
+        request
+            .check_type
+            .parse()
+            .map_err(|e: metafuse_catalog_core::CatalogError| {
+                QualityError::DatabaseError(e.to_string())
+            })?;
+    let severity: QualityCheckSeverity =
+        request
+            .severity
+            .parse()
+            .map_err(|e: metafuse_catalog_core::CatalogError| {
+                QualityError::DatabaseError(e.to_string())
+            })?;
+
+    conn.execute(
+        r#"
+        INSERT INTO quality_checks (
+            id, dataset_id, check_type, check_name, check_description, check_config,
+            severity, warn_threshold, fail_threshold, enabled, schedule, on_demand,
+            created_at, updated_at, created_by, tenant_id
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+            datetime('now'), datetime('now'), ?13, ?14
+        )
+        "#,
+        rusqlite::params![
+            check_id,
+            dataset_id,
+            check_type.to_string(),
+            request.check_name,
+            request.check_description,
+            request.check_config,
+            severity.to_string(),
+            request.warn_threshold,
+            request.fail_threshold,
+            request.enabled,
+            request.schedule,
+            request.on_demand,
+            created_by,
+            tenant_id,
+        ],
+    )
+    .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    let now = chrono::Utc::now();
+    Ok(QualityCheck {
+        id: check_id,
+        dataset_id,
+        check_type,
+        check_name: request.check_name.clone(),
+        check_description: request.check_description.clone(),
+        check_config: request.check_config.clone(),
+        severity,
+        warn_threshold: request.warn_threshold,
+        fail_threshold: request.fail_threshold,
+        enabled: request.enabled,
+        schedule: request.schedule.clone(),
+        on_demand: request.on_demand,
+        created_at: now,
+        updated_at: now,
+        created_by: created_by.map(String::from),
+        tenant_id: tenant_id.map(String::from),
+    })
+}
+
+/// Get all quality checks for a dataset
+pub fn get_quality_checks(
+    conn: &rusqlite::Connection,
+    dataset_id: i64,
+) -> Result<Vec<QualityCheck>, QualityError> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+        SELECT id, dataset_id, check_type, check_name, check_description, check_config,
+               severity, warn_threshold, fail_threshold, enabled, schedule, on_demand,
+               created_at, updated_at, created_by, tenant_id
+        FROM quality_checks
+        WHERE dataset_id = ?1 AND enabled = 1
+        ORDER BY created_at
+        "#,
+        )
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    let checks = stmt
+        .query_map([dataset_id], |row| {
+            let check_type_str: String = row.get(2)?;
+            let severity_str: String = row.get(6)?;
+            let created_at_str: String = row.get(12)?;
+            let updated_at_str: String = row.get(13)?;
+
+            Ok(QualityCheck {
+                id: row.get(0)?,
+                dataset_id: row.get(1)?,
+                check_type: check_type_str.parse().unwrap_or(QualityCheckType::Custom),
+                check_name: row.get(3)?,
+                check_description: row.get(4)?,
+                check_config: row.get(5)?,
+                severity: severity_str
+                    .parse()
+                    .unwrap_or(QualityCheckSeverity::Warning),
+                warn_threshold: row.get(7)?,
+                fail_threshold: row.get(8)?,
+                enabled: row.get(9)?,
+                schedule: row.get(10)?,
+                on_demand: row.get(11)?,
+                created_at: chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+                updated_at: chrono::DateTime::parse_from_rfc3339(&updated_at_str)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+                created_by: row.get(14)?,
+                tenant_id: row.get(15)?,
+            })
+        })
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    Ok(checks)
+}
+
+/// Get a quality check by ID
+pub fn get_quality_check(
+    conn: &rusqlite::Connection,
+    check_id: &str,
+) -> Result<Option<QualityCheck>, QualityError> {
+    let result = conn.query_row(
+        r#"
+        SELECT id, dataset_id, check_type, check_name, check_description, check_config,
+               severity, warn_threshold, fail_threshold, enabled, schedule, on_demand,
+               created_at, updated_at, created_by, tenant_id
+        FROM quality_checks
+        WHERE id = ?1
+        "#,
+        [check_id],
+        |row| {
+            let check_type_str: String = row.get(2)?;
+            let severity_str: String = row.get(6)?;
+            let created_at_str: String = row.get(12)?;
+            let updated_at_str: String = row.get(13)?;
+
+            Ok(QualityCheck {
+                id: row.get(0)?,
+                dataset_id: row.get(1)?,
+                check_type: check_type_str.parse().unwrap_or(QualityCheckType::Custom),
+                check_name: row.get(3)?,
+                check_description: row.get(4)?,
+                check_config: row.get(5)?,
+                severity: severity_str
+                    .parse()
+                    .unwrap_or(QualityCheckSeverity::Warning),
+                warn_threshold: row.get(7)?,
+                fail_threshold: row.get(8)?,
+                enabled: row.get(9)?,
+                schedule: row.get(10)?,
+                on_demand: row.get(11)?,
+                created_at: chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+                updated_at: chrono::DateTime::parse_from_rfc3339(&updated_at_str)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+                created_by: row.get(14)?,
+                tenant_id: row.get(15)?,
+            })
+        },
+    );
+
+    match result {
+        Ok(check) => Ok(Some(check)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(QualityError::DatabaseError(e.to_string())),
+    }
+}
+
+/// Store a quality check result
+pub fn store_quality_check_result(
+    conn: &rusqlite::Connection,
+    result: &QualityCheckResult,
+) -> Result<(), QualityError> {
+    conn.execute(
+        r#"
+        INSERT INTO quality_results (
+            id, check_id, dataset_id, status, score, details, error_message,
+            records_checked, records_failed, executed_at, execution_time_ms,
+            execution_mode, delta_version
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
+        )
+        "#,
+        rusqlite::params![
+            result.id,
+            result.check_id,
+            result.dataset_id,
+            result.status.to_string(),
+            result.score,
+            result.details,
+            result.error_message,
+            result.records_checked,
+            result.records_failed,
+            result.executed_at.to_rfc3339(),
+            result.execution_time_ms,
+            result.execution_mode.to_string(),
+            result.delta_version,
+        ],
+    )
+    .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    Ok(())
+}
+
+/// Get quality check results for a dataset
+pub fn get_quality_check_results(
+    conn: &rusqlite::Connection,
+    dataset_id: i64,
+    limit: Option<i64>,
+) -> Result<Vec<QualityCheckResult>, QualityError> {
+    let limit = limit.unwrap_or(100);
+
+    let mut stmt = conn
+        .prepare(
+            r#"
+        SELECT id, check_id, dataset_id, status, score, details, error_message,
+               records_checked, records_failed, executed_at, execution_time_ms,
+               execution_mode, delta_version
+        FROM quality_results
+        WHERE dataset_id = ?1
+        ORDER BY executed_at DESC
+        LIMIT ?2
+        "#,
+        )
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    let results = stmt
+        .query_map([dataset_id, limit], |row| {
+            let status_str: String = row.get(3)?;
+            let executed_at_str: String = row.get(9)?;
+            let mode_str: String = row.get(11)?;
+
+            Ok(QualityCheckResult {
+                id: row.get(0)?,
+                check_id: row.get(1)?,
+                dataset_id: row.get(2)?,
+                status: status_str.parse().unwrap_or(QualityCheckStatus::Error),
+                score: row.get(4)?,
+                details: row.get(5)?,
+                error_message: row.get(6)?,
+                records_checked: row.get(7)?,
+                records_failed: row.get(8)?,
+                executed_at: chrono::DateTime::parse_from_rfc3339(&executed_at_str)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+                execution_time_ms: row.get(10)?,
+                execution_mode: if mode_str == "scheduled" {
+                    QualityCheckExecutionMode::Scheduled
+                } else {
+                    QualityCheckExecutionMode::OnDemand
+                },
+                delta_version: row.get(12)?,
+            })
+        })
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    Ok(results)
+}
+
+/// Delete a quality check
+pub fn delete_quality_check(
+    conn: &rusqlite::Connection,
+    check_id: &str,
+) -> Result<bool, QualityError> {
+    let rows = conn
+        .execute("DELETE FROM quality_checks WHERE id = ?1", [check_id])
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    Ok(rows > 0)
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -820,5 +1451,860 @@ mod tests {
         // Query non-existent dataset
         let result = get_latest_quality(&conn, 9999, "nonexistent").unwrap();
         assert!(result.is_none());
+    }
+}
+
+// =============================================================================
+// Background Scheduled Quality Check Task
+// =============================================================================
+
+use std::time::Duration;
+
+/// Default interval for scheduled quality check runs (60 seconds)
+const DEFAULT_SCHEDULED_CHECK_INTERVAL_SECS: u64 = 60;
+
+/// Configuration for the scheduled quality check background task
+#[derive(Debug, Clone)]
+pub struct ScheduledQualityCheckConfig {
+    /// How often to check for due quality checks (seconds)
+    pub check_interval_secs: u64,
+    /// Minimum interval between executions of the same check (seconds)
+    /// Prevents re-running a check too frequently even if schedule allows
+    pub min_execution_interval_secs: i64,
+    /// Whether scheduled execution is enabled
+    pub enabled: bool,
+}
+
+impl Default for ScheduledQualityCheckConfig {
+    fn default() -> Self {
+        Self {
+            check_interval_secs: DEFAULT_SCHEDULED_CHECK_INTERVAL_SECS,
+            min_execution_interval_secs: 300, // 5 minutes minimum between runs
+            enabled: true,
+        }
+    }
+}
+
+/// Information about a scheduled quality check that is due for execution
+#[derive(Debug, Clone)]
+pub struct DueQualityCheck {
+    pub check: QualityCheck,
+    pub dataset_id: i64,
+    pub dataset_name: String,
+    pub delta_location: Option<String>,
+    pub last_executed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Find scheduled quality checks that are due for execution
+///
+/// A check is due if:
+/// 1. It has a schedule (not NULL)
+/// 2. It's enabled
+/// 3. It hasn't been executed within min_execution_interval_secs
+pub fn find_due_quality_checks(
+    conn: &rusqlite::Connection,
+    min_interval_secs: i64,
+) -> Result<Vec<DueQualityCheck>, QualityError> {
+    // Query checks with their last execution time
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+                qc.id, qc.dataset_id, qc.check_type, qc.check_name, qc.check_description,
+                qc.check_config, qc.severity, qc.warn_threshold, qc.fail_threshold,
+                qc.enabled, qc.schedule, qc.on_demand, qc.created_at, qc.updated_at,
+                qc.created_by, qc.tenant_id,
+                d.name as dataset_name, d.delta_location,
+                (SELECT MAX(executed_at) FROM quality_results WHERE check_id = qc.id) as last_executed
+            FROM quality_checks qc
+            JOIN datasets d ON d.id = qc.dataset_id
+            WHERE qc.enabled = 1
+              AND qc.schedule IS NOT NULL
+              AND (
+                  -- Never executed, or executed more than min_interval_secs ago
+                  (SELECT MAX(executed_at) FROM quality_results WHERE check_id = qc.id) IS NULL
+                  OR (julianday('now') - julianday((SELECT MAX(executed_at) FROM quality_results WHERE check_id = qc.id))) * 86400 > ?1
+              )
+            ORDER BY last_executed ASC NULLS FIRST
+            LIMIT 100
+            "#,
+        )
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    let due_checks = stmt
+        .query_map([min_interval_secs], |row| {
+            let check_type_str: String = row.get(2)?;
+            let severity_str: String = row.get(6)?;
+            let created_at_str: String = row.get(12)?;
+            let updated_at_str: String = row.get(13)?;
+            let last_executed_str: Option<String> = row.get(18)?;
+
+            let check = QualityCheck {
+                id: row.get(0)?,
+                dataset_id: row.get(1)?,
+                check_type: check_type_str.parse().unwrap_or(QualityCheckType::Custom),
+                check_name: row.get(3)?,
+                check_description: row.get(4)?,
+                check_config: row.get(5)?,
+                severity: severity_str
+                    .parse()
+                    .unwrap_or(QualityCheckSeverity::Warning),
+                warn_threshold: row.get(7)?,
+                fail_threshold: row.get(8)?,
+                enabled: row.get(9)?,
+                schedule: row.get(10)?,
+                on_demand: row.get(11)?,
+                created_at: chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+                updated_at: chrono::DateTime::parse_from_rfc3339(&updated_at_str)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+                created_by: row.get(14)?,
+                tenant_id: row.get(15)?,
+            };
+
+            let last_executed_at = last_executed_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            });
+
+            Ok(DueQualityCheck {
+                check,
+                dataset_id: row.get(1)?,
+                dataset_name: row.get(16)?,
+                delta_location: row.get(17)?,
+                last_executed_at,
+            })
+        })
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    Ok(due_checks)
+}
+
+/// Background task that periodically executes scheduled quality checks
+///
+/// This task:
+/// 1. Runs every `check_interval_secs` seconds
+/// 2. Queries for quality checks that are due for execution
+/// 3. Executes each check using pre-fetched data (no connection held across await)
+/// 4. Stores results and optionally triggers alerts
+pub async fn quality_check_task(
+    delta_reader: std::sync::Arc<metafuse_catalog_delta::DeltaReader>,
+    backend: std::sync::Arc<metafuse_catalog_storage::DynCatalogBackend>,
+    config: ScheduledQualityCheckConfig,
+) {
+    let interval = Duration::from_secs(config.check_interval_secs);
+
+    info!(
+        interval_secs = config.check_interval_secs,
+        min_execution_interval_secs = config.min_execution_interval_secs,
+        "Scheduled quality check task started"
+    );
+
+    loop {
+        tokio::time::sleep(interval).await;
+
+        if !config.enabled {
+            debug!("Scheduled quality checks disabled, skipping");
+            continue;
+        }
+
+        debug!("Running scheduled quality check scan");
+
+        // Phase 1: Get connection and find due checks
+        let due_checks = match backend.get_connection().await {
+            Ok(conn) => match find_due_quality_checks(&conn, config.min_execution_interval_secs) {
+                Ok(checks) => checks,
+                Err(e) => {
+                    warn!(error = %e, "Failed to query due quality checks");
+                    continue;
+                }
+            },
+            Err(e) => {
+                warn!(error = %e, "Failed to get database connection for quality check scan");
+                continue;
+            }
+        };
+
+        if due_checks.is_empty() {
+            debug!("No scheduled quality checks due");
+            continue;
+        }
+
+        info!(
+            count = due_checks.len(),
+            "Found scheduled quality checks due for execution"
+        );
+
+        // Process each due check
+        for due_check in due_checks {
+            // Phase 2: Pre-fetch freshness config if needed
+            let freshness_config = if due_check.check.check_type == QualityCheckType::Freshness {
+                match backend.get_connection().await {
+                    Ok(conn) => conn
+                        .query_row(
+                            "SELECT expected_interval_secs, grace_period_secs FROM freshness_config WHERE dataset_id = ?1",
+                            [due_check.dataset_id],
+                            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                        )
+                        .ok(),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+
+            // Phase 3: Get Delta metadata if available (async, no connection)
+            let delta_metadata = if let Some(ref loc) = due_check.delta_location {
+                match delta_reader.get_metadata_cached(loc).await {
+                    Ok(metadata) => Some(metadata),
+                    Err(e) => {
+                        debug!(
+                            check_id = %due_check.check.id,
+                            error = %e,
+                            "Failed to get Delta metadata for scheduled check"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Phase 4: Execute check
+            let start = std::time::Instant::now();
+            let result_id = uuid::Uuid::new_v4().to_string();
+
+            let (score, details, records_checked, records_failed, status) =
+                execute_check_sync(&due_check, &delta_metadata, &freshness_config);
+
+            let execution_time_ms = start.elapsed().as_millis() as i64;
+
+            let result = QualityCheckResult {
+                id: result_id,
+                check_id: due_check.check.id.clone(),
+                dataset_id: due_check.dataset_id,
+                status,
+                score: Some(score),
+                details,
+                error_message: None,
+                records_checked: Some(records_checked),
+                records_failed: Some(records_failed),
+                executed_at: chrono::Utc::now(),
+                execution_time_ms: Some(execution_time_ms),
+                execution_mode: QualityCheckExecutionMode::Scheduled,
+                delta_version: delta_metadata.as_ref().map(|m| m.version),
+            };
+
+            // Phase 5: Store result (new connection)
+            match backend.get_connection().await {
+                Ok(conn) => {
+                    if let Err(e) = store_quality_check_result(&conn, &result) {
+                        warn!(
+                            check_id = %due_check.check.id,
+                            error = %e,
+                            "Failed to store scheduled check result"
+                        );
+                    } else {
+                        info!(
+                            check_id = %due_check.check.id,
+                            check_name = %due_check.check.check_name,
+                            dataset_name = %due_check.dataset_name,
+                            status = %result.status,
+                            score = ?result.score,
+                            execution_time_ms,
+                            "Scheduled quality check executed"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        check_id = %due_check.check.id,
+                        error = %e,
+                        "Failed to get connection to store scheduled check result"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Execute a quality check synchronously using pre-fetched data
+fn execute_check_sync(
+    due_check: &DueQualityCheck,
+    delta_metadata: &Option<metafuse_catalog_delta::DeltaMetadata>,
+    freshness_config: &Option<(i64, i64)>,
+) -> (f64, Option<String>, i64, i64, QualityCheckStatus) {
+    match due_check.check.check_type {
+        QualityCheckType::Completeness => {
+            if let Some(ref metadata) = delta_metadata {
+                let row_count = metadata.row_count;
+                let column_count = metadata.schema.fields.len() as i64;
+
+                if row_count == 0 || column_count == 0 {
+                    (
+                        1.0,
+                        Some(r#"{"status":"empty_table"}"#.to_string()),
+                        0,
+                        0,
+                        QualityCheckStatus::Pass,
+                    )
+                } else {
+                    let total_nulls: i64 = metadata
+                        .column_stats
+                        .iter()
+                        .filter_map(|s| s.null_count)
+                        .sum();
+                    let total_cells = row_count * column_count;
+                    let null_ratio = total_nulls as f64 / total_cells as f64;
+                    let score = (1.0 - null_ratio).clamp(0.0, 1.0);
+                    let details = serde_json::json!({
+                        "row_count": row_count,
+                        "column_count": column_count,
+                        "total_cells": total_cells,
+                        "null_cells": total_nulls,
+                        "null_ratio": null_ratio,
+                    });
+                    let status = determine_status_sync(score, &due_check.check);
+                    (
+                        score,
+                        Some(details.to_string()),
+                        total_cells,
+                        total_nulls,
+                        status,
+                    )
+                }
+            } else {
+                (
+                    1.0,
+                    Some(r#"{"status":"no_delta_metadata"}"#.to_string()),
+                    0,
+                    0,
+                    QualityCheckStatus::Skipped,
+                )
+            }
+        }
+        QualityCheckType::Freshness => {
+            if let Some((expected_interval, grace_period)) = freshness_config {
+                let last_modified = delta_metadata
+                    .as_ref()
+                    .map(|m| m.last_modified)
+                    .unwrap_or_else(chrono::Utc::now);
+
+                let now = chrono::Utc::now();
+                let staleness_secs = (now - last_modified).num_seconds();
+                let threshold_secs = expected_interval + grace_period;
+
+                let score = if staleness_secs <= threshold_secs {
+                    1.0
+                } else {
+                    let extra_staleness = staleness_secs - threshold_secs;
+                    let periods_overdue = extra_staleness as f64 / *expected_interval as f64;
+                    (1.0 / (1.0 + periods_overdue)).clamp(0.0, 1.0)
+                };
+
+                let details = serde_json::json!({
+                    "last_modified": last_modified.to_rfc3339(),
+                    "staleness_secs": staleness_secs,
+                    "expected_interval_secs": expected_interval,
+                    "grace_period_secs": grace_period,
+                    "threshold_secs": threshold_secs,
+                });
+                let failed = if score < 1.0 { 1 } else { 0 };
+                let status = determine_status_sync(score, &due_check.check);
+                (score, Some(details.to_string()), 1, failed, status)
+            } else {
+                (
+                    1.0,
+                    Some(r#"{"status":"no_freshness_config"}"#.to_string()),
+                    0,
+                    0,
+                    QualityCheckStatus::Skipped,
+                )
+            }
+        }
+        _ => {
+            // Uniqueness and Custom checks require external execution
+            let details = serde_json::json!({
+                "status": "requires_external_execution",
+                "message": "This check type requires external data scanning",
+                "check_config": due_check.check.check_config,
+            });
+            (
+                1.0,
+                Some(details.to_string()),
+                0,
+                0,
+                QualityCheckStatus::Skipped,
+            )
+        }
+    }
+}
+
+/// Determine status based on score and thresholds (standalone function)
+fn determine_status_sync(score: f64, check: &QualityCheck) -> QualityCheckStatus {
+    if let Some(fail_threshold) = check.fail_threshold {
+        if score < fail_threshold {
+            return QualityCheckStatus::Fail;
+        }
+    }
+    if let Some(warn_threshold) = check.warn_threshold {
+        if score < warn_threshold {
+            return QualityCheckStatus::Warn;
+        }
+    }
+    QualityCheckStatus::Pass
+}
+
+// =============================================================================
+// Freshness Violation Detection
+// =============================================================================
+
+use metafuse_catalog_core::FreshnessViolation;
+
+/// Information about a dataset that may be violating its freshness SLA
+#[derive(Debug, Clone)]
+pub struct FreshnessCheckTarget {
+    pub dataset_id: i64,
+    pub dataset_name: String,
+    pub tenant_id: Option<String>,
+    pub delta_location: Option<String>,
+    pub last_updated: Option<chrono::DateTime<chrono::Utc>>,
+    pub expected_interval_secs: i64,
+    pub grace_period_secs: i64,
+    pub alert_on_stale: bool,
+}
+
+/// Detect freshness violations for all datasets with freshness config
+///
+/// Returns newly detected violations (not already open for the same dataset)
+pub fn detect_freshness_violations(
+    conn: &rusqlite::Connection,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<FreshnessViolation>, QualityError> {
+    // Find datasets that are stale but don't have an open violation
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+                d.id,
+                d.name,
+                d.tenant,
+                d.last_updated,
+                d.delta_location,
+                fc.expected_interval_secs,
+                fc.grace_period_secs,
+                fc.alert_on_stale
+            FROM datasets d
+            JOIN freshness_config fc ON d.id = fc.dataset_id
+            WHERE d.last_updated IS NOT NULL
+              AND (julianday(?1) - julianday(d.last_updated)) * 86400 > (fc.expected_interval_secs + fc.grace_period_secs)
+              AND NOT EXISTS (
+                  SELECT 1 FROM freshness_violations fv
+                  WHERE fv.dataset_id = d.id AND fv.resolved_at IS NULL
+              )
+            "#,
+        )
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    let stale_datasets = stmt
+        .query_map([now.to_rfc3339()], |row| {
+            let last_updated_str: Option<String> = row.get(3)?;
+            let last_updated = last_updated_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            });
+
+            Ok(FreshnessCheckTarget {
+                dataset_id: row.get(0)?,
+                dataset_name: row.get(1)?,
+                tenant_id: row.get(2)?,
+                delta_location: row.get(4)?,
+                last_updated,
+                expected_interval_secs: row.get(5)?,
+                grace_period_secs: row.get(6)?,
+                alert_on_stale: row.get::<_, i32>(7)? != 0,
+            })
+        })
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    let mut violations = Vec::new();
+
+    for target in stale_datasets {
+        let last_updated = target.last_updated.unwrap_or(now);
+
+        // Calculate when the data should have been updated
+        let expected_by = last_updated
+            + chrono::Duration::seconds(target.expected_interval_secs + target.grace_period_secs);
+
+        let hours_overdue = (now - expected_by).num_seconds() as f64 / 3600.0;
+
+        // Determine SLA label
+        let sla = if target.expected_interval_secs <= 3600 {
+            "hourly"
+        } else if target.expected_interval_secs <= 86400 {
+            "daily"
+        } else if target.expected_interval_secs <= 604800 {
+            "weekly"
+        } else {
+            "custom"
+        };
+
+        let violation = FreshnessViolation {
+            id: uuid::Uuid::new_v4().to_string(),
+            dataset_id: target.dataset_id,
+            expected_by,
+            detected_at: now,
+            resolved_at: None,
+            sla: sla.to_string(),
+            grace_period_minutes: Some((target.grace_period_secs / 60) as i32),
+            hours_overdue: Some(hours_overdue.max(0.0)),
+            last_updated_at: target.last_updated,
+            alert_sent: false,
+            alert_id: None,
+            tenant_id: target.tenant_id,
+        };
+
+        violations.push(violation);
+    }
+
+    Ok(violations)
+}
+
+/// Record a freshness violation in the database
+pub fn record_freshness_violation(
+    conn: &rusqlite::Connection,
+    violation: &FreshnessViolation,
+) -> Result<(), QualityError> {
+    conn.execute(
+        r#"
+        INSERT INTO freshness_violations (
+            id, dataset_id, expected_by, detected_at, resolved_at,
+            sla, grace_period_minutes, hours_overdue, last_updated_at,
+            alert_sent, alert_id, tenant_id
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+        )
+        "#,
+        rusqlite::params![
+            violation.id,
+            violation.dataset_id,
+            violation.expected_by.to_rfc3339(),
+            violation.detected_at.to_rfc3339(),
+            violation.resolved_at.map(|dt| dt.to_rfc3339()),
+            violation.sla,
+            violation.grace_period_minutes,
+            violation.hours_overdue,
+            violation.last_updated_at.map(|dt| dt.to_rfc3339()),
+            violation.alert_sent,
+            violation.alert_id,
+            violation.tenant_id,
+        ],
+    )
+    .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    Ok(())
+}
+
+/// Resolve open freshness violations for a dataset (called when data is updated)
+pub fn resolve_freshness_violations(
+    conn: &rusqlite::Connection,
+    dataset_id: i64,
+    resolved_at: chrono::DateTime<chrono::Utc>,
+) -> Result<usize, QualityError> {
+    let rows = conn
+        .execute(
+            "UPDATE freshness_violations SET resolved_at = ?1 WHERE dataset_id = ?2 AND resolved_at IS NULL",
+            rusqlite::params![resolved_at.to_rfc3339(), dataset_id],
+        )
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    if rows > 0 {
+        info!(
+            dataset_id,
+            resolved_count = rows,
+            "Resolved freshness violations"
+        );
+    }
+
+    Ok(rows)
+}
+
+/// Get open (unresolved) freshness violations
+pub fn get_open_violations(
+    conn: &rusqlite::Connection,
+    dataset_id: Option<i64>,
+) -> Result<Vec<FreshnessViolation>, QualityError> {
+    let sql = if dataset_id.is_some() {
+        r#"
+        SELECT id, dataset_id, expected_by, detected_at, resolved_at,
+               sla, grace_period_minutes, hours_overdue, last_updated_at,
+               alert_sent, alert_id, tenant_id
+        FROM freshness_violations
+        WHERE resolved_at IS NULL AND dataset_id = ?1
+        ORDER BY detected_at DESC
+        "#
+    } else {
+        r#"
+        SELECT id, dataset_id, expected_by, detected_at, resolved_at,
+               sla, grace_period_minutes, hours_overdue, last_updated_at,
+               alert_sent, alert_id, tenant_id
+        FROM freshness_violations
+        WHERE resolved_at IS NULL
+        ORDER BY detected_at DESC
+        LIMIT 100
+        "#
+    };
+
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    let query_result = if let Some(ds_id) = dataset_id {
+        stmt.query_map([ds_id], map_violation_row)
+    } else {
+        stmt.query_map([], map_violation_row)
+    };
+
+    let violations = query_result
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    Ok(violations)
+}
+
+/// Get open (unresolved) freshness violations with pagination
+pub fn get_open_violations_paginated(
+    conn: &rusqlite::Connection,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<FreshnessViolation>, QualityError> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT id, dataset_id, expected_by, detected_at, resolved_at,
+                   sla, grace_period_minutes, hours_overdue, last_updated_at,
+                   alert_sent, alert_id, tenant_id
+            FROM freshness_violations
+            WHERE resolved_at IS NULL
+            ORDER BY detected_at DESC
+            LIMIT ?1 OFFSET ?2
+            "#,
+        )
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    let violations = stmt
+        .query_map([limit, offset], map_violation_row)
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    Ok(violations)
+}
+
+/// Get violations for a dataset (with history)
+pub fn get_dataset_violations(
+    conn: &rusqlite::Connection,
+    dataset_id: i64,
+    limit: i64,
+) -> Result<Vec<FreshnessViolation>, QualityError> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT id, dataset_id, expected_by, detected_at, resolved_at,
+                   sla, grace_period_minutes, hours_overdue, last_updated_at,
+                   alert_sent, alert_id, tenant_id
+            FROM freshness_violations
+            WHERE dataset_id = ?1
+            ORDER BY detected_at DESC
+            LIMIT ?2
+            "#,
+        )
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    let violations = stmt
+        .query_map([dataset_id, limit], map_violation_row)
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    Ok(violations)
+}
+
+/// Get violations that need alerting (unalerted)
+pub fn get_unalerted_violations(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<FreshnessViolation>, QualityError> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT id, dataset_id, expected_by, detected_at, resolved_at,
+                   sla, grace_period_minutes, hours_overdue, last_updated_at,
+                   alert_sent, alert_id, tenant_id
+            FROM freshness_violations
+            WHERE alert_sent = 0 AND resolved_at IS NULL
+            ORDER BY detected_at ASC
+            LIMIT 50
+            "#,
+        )
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    let violations = stmt
+        .query_map([], map_violation_row)
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    Ok(violations)
+}
+
+/// Mark a violation as alerted
+pub fn mark_violation_alerted(
+    conn: &rusqlite::Connection,
+    violation_id: &str,
+    alert_id: Option<&str>,
+) -> Result<(), QualityError> {
+    conn.execute(
+        "UPDATE freshness_violations SET alert_sent = 1, alert_id = ?1 WHERE id = ?2",
+        rusqlite::params![alert_id, violation_id],
+    )
+    .map_err(|e| QualityError::DatabaseError(e.to_string()))?;
+
+    Ok(())
+}
+
+/// Helper function to map a database row to FreshnessViolation
+fn map_violation_row(row: &rusqlite::Row<'_>) -> Result<FreshnessViolation, rusqlite::Error> {
+    let expected_by_str: String = row.get(2)?;
+    let detected_at_str: String = row.get(3)?;
+    let resolved_at_str: Option<String> = row.get(4)?;
+    let last_updated_str: Option<String> = row.get(8)?;
+
+    Ok(FreshnessViolation {
+        id: row.get(0)?,
+        dataset_id: row.get(1)?,
+        expected_by: chrono::DateTime::parse_from_rfc3339(&expected_by_str)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| chrono::Utc::now()),
+        detected_at: chrono::DateTime::parse_from_rfc3339(&detected_at_str)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| chrono::Utc::now()),
+        resolved_at: resolved_at_str.and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        }),
+        sla: row.get(5)?,
+        grace_period_minutes: row.get(6)?,
+        hours_overdue: row.get(7)?,
+        last_updated_at: last_updated_str.and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        }),
+        alert_sent: row.get::<_, i32>(9)? != 0,
+        alert_id: row.get(10)?,
+        tenant_id: row.get(11)?,
+    })
+}
+
+/// Background task for freshness violation detection
+///
+/// Runs periodically to:
+/// 1. Detect new freshness violations
+/// 2. Record them in the database
+/// 3. Queue them for alerting
+pub async fn freshness_check_task(
+    backend: std::sync::Arc<metafuse_catalog_storage::DynCatalogBackend>,
+    config: FreshnessCheckConfig,
+) {
+    let interval = Duration::from_secs(config.check_interval_secs);
+
+    info!(
+        interval_secs = config.check_interval_secs,
+        "Freshness violation detection task started"
+    );
+
+    loop {
+        tokio::time::sleep(interval).await;
+
+        if !config.enabled {
+            debug!("Freshness violation detection disabled, skipping");
+            continue;
+        }
+
+        debug!("Running freshness violation detection");
+
+        match backend.get_connection().await {
+            Ok(conn) => {
+                let now = chrono::Utc::now();
+
+                // Detect violations
+                let violations = match detect_freshness_violations(&conn, now) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(error = %e, "Failed to detect freshness violations");
+                        continue;
+                    }
+                };
+
+                if violations.is_empty() {
+                    debug!("No new freshness violations detected");
+                    continue;
+                }
+
+                info!(
+                    count = violations.len(),
+                    "New freshness violations detected"
+                );
+
+                // Record each violation
+                for violation in &violations {
+                    if let Err(e) = record_freshness_violation(&conn, violation) {
+                        warn!(
+                            dataset_id = violation.dataset_id,
+                            error = %e,
+                            "Failed to record freshness violation"
+                        );
+                    } else {
+                        info!(
+                            dataset_id = violation.dataset_id,
+                            sla = %violation.sla,
+                            hours_overdue = ?violation.hours_overdue,
+                            "Freshness violation recorded"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to get connection for freshness check");
+            }
+        }
+    }
+}
+
+/// Configuration for freshness violation detection
+#[derive(Debug, Clone)]
+pub struct FreshnessCheckConfig {
+    /// How often to check for freshness violations (seconds)
+    pub check_interval_secs: u64,
+    /// Whether freshness detection is enabled
+    pub enabled: bool,
+}
+
+impl Default for FreshnessCheckConfig {
+    fn default() -> Self {
+        Self {
+            check_interval_secs: 60, // Check every minute
+            enabled: true,
+        }
     }
 }

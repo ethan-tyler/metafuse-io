@@ -13,6 +13,17 @@
 //! - On demand via API
 //!
 //! Contract violations trigger alerts through the alerting module.
+//!
+//! # Fail-Open Behavior
+//!
+//! Contract evaluation requires datasets to have `delta_location` configured.
+//! For non-Delta datasets (CSV, Parquet, external tables), contract evaluation
+//! is skipped entirely ("fail open") rather than blocking operations. This:
+//! - Maintains backwards compatibility with existing non-Delta datasets
+//! - Allows gradual adoption of contracts without breaking existing workflows
+//! - Enables operators to enforce Delta-only ingestion at the org level if needed
+//!
+//! Similarly, freshness contracts fail open when staleness metrics are unavailable.
 
 use serde::{Deserialize, Serialize};
 
@@ -355,6 +366,456 @@ impl ValidationResult {
             validated_at: chrono::Utc::now().to_rfc3339(),
         }
     }
+}
+
+// =============================================================================
+// Contract Evaluation Engine
+// =============================================================================
+
+/// Context for evaluating contracts against a dataset
+#[derive(Debug, Clone)]
+pub struct DatasetContext {
+    /// Dataset ID
+    pub id: i64,
+    /// Dataset name
+    pub name: String,
+    /// Tenant ID (for multi-tenant isolation)
+    pub tenant_id: Option<String>,
+}
+
+/// Field information from the catalog
+#[derive(Debug, Clone)]
+pub struct FieldInfo {
+    pub name: String,
+    pub data_type: String,
+    pub nullable: bool,
+}
+
+/// Quality metrics for contract evaluation
+#[derive(Debug, Clone, Default)]
+pub struct QualityMetrics {
+    pub completeness_score: Option<f64>,
+    pub freshness_score: Option<f64>,
+    pub overall_score: Option<f64>,
+    pub staleness_secs: Option<i64>,
+}
+
+/// Result of contract enforcement
+#[derive(Debug, Clone)]
+pub enum EnforcementAction {
+    /// Allow the operation
+    Allow,
+    /// Warn but allow
+    Warn(Vec<String>),
+    /// Block with violations
+    Block(Vec<String>),
+    /// Alert and allow
+    Alert(Vec<String>),
+}
+
+impl EnforcementAction {
+    /// Check if the action should block the operation
+    pub fn should_block(&self) -> bool {
+        matches!(self, EnforcementAction::Block(_))
+    }
+
+    /// Get violations if any
+    pub fn violations(&self) -> Option<&[String]> {
+        match self {
+            EnforcementAction::Allow => None,
+            EnforcementAction::Warn(v)
+            | EnforcementAction::Block(v)
+            | EnforcementAction::Alert(v) => Some(v),
+        }
+    }
+}
+
+/// Contract evaluator for validating datasets against contracts
+pub struct ContractEvaluator<'a> {
+    conn: &'a rusqlite::Connection,
+}
+
+impl<'a> ContractEvaluator<'a> {
+    /// Create a new contract evaluator
+    pub fn new(conn: &'a rusqlite::Connection) -> Self {
+        Self { conn }
+    }
+
+    /// Evaluate all matching contracts for a dataset
+    ///
+    /// Returns a list of validation results for each matching contract.
+    pub fn evaluate_for_dataset(
+        &self,
+        ctx: &DatasetContext,
+    ) -> Result<Vec<ValidationResult>, rusqlite::Error> {
+        let contracts = find_matching_contracts(self.conn, &ctx.name)?;
+        let mut results = Vec::new();
+
+        for contract in contracts {
+            let result = self.evaluate_contract(&contract, ctx)?;
+            results.push(result);
+        }
+
+        Ok(results)
+    }
+
+    /// Evaluate a single contract against a dataset
+    pub fn evaluate_contract(
+        &self,
+        contract: &DataContract,
+        ctx: &DatasetContext,
+    ) -> Result<ValidationResult, rusqlite::Error> {
+        let mut all_violations = Vec::new();
+
+        // Evaluate schema contract if present
+        if let Some(ref schema_contract) = contract.schema_contract {
+            let fields = self.get_dataset_fields(ctx.id)?;
+            let violations = evaluate_schema_contract(schema_contract, &fields);
+            all_violations.extend(violations);
+        }
+
+        // Evaluate quality contract if present
+        if let Some(ref quality_contract) = contract.quality_contract {
+            let metrics = self.get_quality_metrics(ctx.id)?;
+            let violations = evaluate_quality_contract(quality_contract, &metrics);
+            all_violations.extend(violations);
+        }
+
+        // Evaluate freshness contract if present
+        if let Some(ref freshness_contract) = contract.freshness_contract {
+            let metrics = self.get_quality_metrics(ctx.id)?;
+            let violations = evaluate_freshness_contract(freshness_contract, &metrics);
+            all_violations.extend(violations);
+        }
+
+        if all_violations.is_empty() {
+            Ok(ValidationResult::pass(&contract.name, &ctx.name))
+        } else {
+            Ok(ValidationResult::fail(
+                &contract.name,
+                &ctx.name,
+                all_violations,
+            ))
+        }
+    }
+
+    /// Determine enforcement action based on contract and violations
+    pub fn determine_enforcement(
+        &self,
+        contract: &DataContract,
+        violations: &[String],
+    ) -> EnforcementAction {
+        if violations.is_empty() {
+            return EnforcementAction::Allow;
+        }
+
+        match contract.on_violation {
+            OnViolation::Alert => EnforcementAction::Alert(violations.to_vec()),
+            OnViolation::Warn => EnforcementAction::Warn(violations.to_vec()),
+            OnViolation::Block => EnforcementAction::Block(violations.to_vec()),
+        }
+    }
+
+    /// Get fields for a dataset from the catalog
+    fn get_dataset_fields(&self, dataset_id: i64) -> Result<Vec<FieldInfo>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, data_type, nullable FROM fields WHERE dataset_id = ?1 ORDER BY name",
+        )?;
+
+        let fields = stmt
+            .query_map([dataset_id], |row| {
+                Ok(FieldInfo {
+                    name: row.get(0)?,
+                    data_type: row.get(1)?,
+                    nullable: row.get::<_, i32>(2)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(fields)
+    }
+
+    /// Get quality metrics for a dataset
+    fn get_quality_metrics(&self, dataset_id: i64) -> Result<QualityMetrics, rusqlite::Error> {
+        let result = self.conn.query_row(
+            r#"
+            SELECT completeness_score, freshness_score, overall_score
+            FROM quality_metrics
+            WHERE dataset_id = ?1
+            ORDER BY computed_at DESC
+            LIMIT 1
+            "#,
+            [dataset_id],
+            |row| {
+                Ok(QualityMetrics {
+                    completeness_score: row.get(0)?,
+                    freshness_score: row.get(1)?,
+                    overall_score: row.get(2)?,
+                    staleness_secs: None, // Will be computed from last_updated if needed
+                })
+            },
+        );
+
+        match result {
+            Ok(mut metrics) => {
+                // Try to get staleness from dataset's last_updated
+                if let Ok(staleness) = self.get_staleness_secs(dataset_id) {
+                    metrics.staleness_secs = Some(staleness);
+                }
+                Ok(metrics)
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(QualityMetrics::default()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Calculate staleness in seconds from dataset's last_updated
+    fn get_staleness_secs(&self, dataset_id: i64) -> Result<i64, rusqlite::Error> {
+        let last_updated: String = self.conn.query_row(
+            "SELECT last_updated FROM datasets WHERE id = ?1",
+            [dataset_id],
+            |row| row.get(0),
+        )?;
+
+        // Parse timestamp and calculate staleness
+        if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&last_updated) {
+            let now = chrono::Utc::now();
+            let staleness = (now - ts.with_timezone(&chrono::Utc)).num_seconds();
+            Ok(staleness.max(0))
+        } else {
+            // Try simpler formats
+            if let Ok(ts) =
+                chrono::NaiveDateTime::parse_from_str(&last_updated, "%Y-%m-%d %H:%M:%S")
+            {
+                let now = chrono::Utc::now().naive_utc();
+                let staleness = (now - ts).num_seconds();
+                Ok(staleness.max(0))
+            } else {
+                Ok(0)
+            }
+        }
+    }
+}
+
+/// Evaluate schema contract against dataset fields
+///
+/// Returns a list of violations (empty if contract is satisfied).
+pub fn evaluate_schema_contract(contract: &SchemaContract, fields: &[FieldInfo]) -> Vec<String> {
+    let mut violations = Vec::new();
+
+    // Build a map of existing fields for quick lookup
+    let field_map: std::collections::HashMap<&str, &FieldInfo> =
+        fields.iter().map(|f| (f.name.as_str(), f)).collect();
+
+    // Check required columns
+    for required in &contract.required_columns {
+        match field_map.get(required.name.as_str()) {
+            None => {
+                violations.push(format!(
+                    "Missing required column: '{}' (expected type: {})",
+                    required.name, required.data_type
+                ));
+            }
+            Some(field) => {
+                // Check type compatibility (case-insensitive)
+                if !types_compatible(&field.data_type, &required.data_type) {
+                    violations.push(format!(
+                        "Column '{}' has type '{}' but contract requires '{}'",
+                        required.name, field.data_type, required.data_type
+                    ));
+                }
+
+                // Check nullable constraint (if required column is non-nullable)
+                if !required.nullable && field.nullable {
+                    violations.push(format!(
+                        "Column '{}' is nullable but contract requires non-nullable",
+                        required.name
+                    ));
+                }
+            }
+        }
+    }
+
+    // Check for additional columns if not allowed
+    if !contract.allow_additional_columns {
+        let required_names: std::collections::HashSet<&str> = contract
+            .required_columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+
+        for field in fields {
+            if !required_names.contains(field.name.as_str()) {
+                violations.push(format!(
+                    "Unexpected column '{}' not allowed by contract",
+                    field.name
+                ));
+            }
+        }
+    }
+
+    violations
+}
+
+/// Check if two data types are compatible
+///
+/// Supports common type aliases and variations.
+fn types_compatible(actual: &str, required: &str) -> bool {
+    let actual_lower = actual.to_lowercase();
+    let required_lower = required.to_lowercase();
+
+    if actual_lower == required_lower {
+        return true;
+    }
+
+    // Normalize types to canonical forms
+    fn normalize(t: &str) -> &'static str {
+        match t {
+            // Integer types
+            "int64" | "bigint" | "long" | "integer" => "int64",
+            "int32" | "int" => "int32",
+            // String types
+            "utf8" | "string" | "text" | "varchar" => "utf8",
+            // Float types
+            "float64" | "double" | "float" => "float64",
+            "float32" => "float32",
+            // Boolean
+            "bool" | "boolean" => "bool",
+            // Timestamp
+            "timestamp" | "datetime" | "timestamp[us]" | "timestamp[ns]" => "timestamp",
+            // Date
+            "date" | "date32" => "date",
+            // Keep as-is - return empty to signal no normalization
+            _ => "",
+        }
+    }
+
+    let actual_norm = normalize(&actual_lower);
+    let required_norm = normalize(&required_lower);
+
+    // If both normalize to the same non-empty string, they're compatible
+    if !actual_norm.is_empty() && !required_norm.is_empty() {
+        actual_norm == required_norm
+    } else {
+        // No normalization possible, check exact match (already done above)
+        false
+    }
+}
+
+/// Evaluate quality contract against metrics
+///
+/// Returns a list of violations (empty if contract is satisfied).
+pub fn evaluate_quality_contract(
+    contract: &QualityContract,
+    metrics: &QualityMetrics,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+
+    // Check min_completeness
+    if let Some(min_completeness) = contract.min_completeness {
+        match metrics.completeness_score {
+            Some(score) if score < min_completeness => {
+                violations.push(format!(
+                    "Completeness score {:.1}% is below required {:.1}%",
+                    score * 100.0,
+                    min_completeness * 100.0
+                ));
+            }
+            None => {
+                violations.push(
+                    "Completeness score not available but contract requires min_completeness"
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // Check min_freshness
+    if let Some(min_freshness) = contract.min_freshness {
+        match metrics.freshness_score {
+            Some(score) if score < min_freshness => {
+                violations.push(format!(
+                    "Freshness score {:.1}% is below required {:.1}%",
+                    score * 100.0,
+                    min_freshness * 100.0
+                ));
+            }
+            None => {
+                violations.push(
+                    "Freshness score not available but contract requires min_freshness".to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // Check min_overall
+    if let Some(min_overall) = contract.min_overall {
+        match metrics.overall_score {
+            Some(score) if score < min_overall => {
+                violations.push(format!(
+                    "Overall quality score {:.1}% is below required {:.1}%",
+                    score * 100.0,
+                    min_overall * 100.0
+                ));
+            }
+            None => {
+                violations.push(
+                    "Overall quality score not available but contract requires min_overall"
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    violations
+}
+
+/// Evaluate freshness contract against metrics
+///
+/// Returns a list of violations (empty if contract is satisfied).
+pub fn evaluate_freshness_contract(
+    contract: &FreshnessContract,
+    metrics: &QualityMetrics,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+
+    // Check max staleness
+    match metrics.staleness_secs {
+        Some(staleness) if staleness > contract.max_staleness_secs => {
+            let hours = staleness / 3600;
+            let max_hours = contract.max_staleness_secs / 3600;
+            violations.push(format!(
+                "Dataset staleness ({} hours) exceeds max allowed ({} hours)",
+                hours, max_hours
+            ));
+        }
+        None => {
+            // Can't evaluate - fail open (no violation)
+            tracing::debug!(
+                "Staleness not available for freshness contract evaluation, failing open"
+            );
+        }
+        _ => {}
+    }
+
+    // Check expected interval if specified
+    if let Some(expected_interval) = contract.expected_interval_secs {
+        if let Some(staleness) = metrics.staleness_secs {
+            // Warn if staleness is more than 2x expected interval
+            if staleness > expected_interval * 2 {
+                let periods_late = staleness / expected_interval;
+                violations.push(format!(
+                    "Dataset is {} update periods behind expected interval",
+                    periods_late
+                ));
+            }
+        }
+    }
+
+    violations
 }
 
 // =============================================================================
@@ -1127,5 +1588,441 @@ mod tests {
         // Try to update non-existent contract
         let not_found = update_contract(&conn, "nonexistent", &updated_contract).unwrap();
         assert!(!not_found);
+    }
+
+    // =============================================================================
+    // Contract Evaluation Tests
+    // =============================================================================
+
+    #[test]
+    fn test_evaluate_schema_contract_pass() {
+        let contract = SchemaContract {
+            required_columns: vec![
+                RequiredColumn {
+                    name: "order_id".to_string(),
+                    data_type: "Int64".to_string(),
+                    nullable: false,
+                },
+                RequiredColumn {
+                    name: "customer_name".to_string(),
+                    data_type: "Utf8".to_string(),
+                    nullable: true,
+                },
+            ],
+            allow_additional_columns: true,
+        };
+
+        let fields = vec![
+            FieldInfo {
+                name: "order_id".to_string(),
+                data_type: "Int64".to_string(),
+                nullable: false,
+            },
+            FieldInfo {
+                name: "customer_name".to_string(),
+                data_type: "Utf8".to_string(),
+                nullable: true,
+            },
+            FieldInfo {
+                name: "extra_field".to_string(),
+                data_type: "Float64".to_string(),
+                nullable: true,
+            },
+        ];
+
+        let violations = evaluate_schema_contract(&contract, &fields);
+        assert!(
+            violations.is_empty(),
+            "Expected no violations: {:?}",
+            violations
+        );
+    }
+
+    #[test]
+    fn test_evaluate_schema_contract_missing_column() {
+        let contract = SchemaContract {
+            required_columns: vec![RequiredColumn {
+                name: "order_id".to_string(),
+                data_type: "Int64".to_string(),
+                nullable: false,
+            }],
+            allow_additional_columns: true,
+        };
+
+        let fields = vec![FieldInfo {
+            name: "customer_id".to_string(),
+            data_type: "Int64".to_string(),
+            nullable: false,
+        }];
+
+        let violations = evaluate_schema_contract(&contract, &fields);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("Missing required column"));
+        assert!(violations[0].contains("order_id"));
+    }
+
+    #[test]
+    fn test_evaluate_schema_contract_wrong_type() {
+        let contract = SchemaContract {
+            required_columns: vec![RequiredColumn {
+                name: "amount".to_string(),
+                data_type: "Float64".to_string(),
+                nullable: true,
+            }],
+            allow_additional_columns: true,
+        };
+
+        let fields = vec![FieldInfo {
+            name: "amount".to_string(),
+            data_type: "Utf8".to_string(), // Wrong type
+            nullable: true,
+        }];
+
+        let violations = evaluate_schema_contract(&contract, &fields);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("has type"));
+        assert!(violations[0].contains("Utf8"));
+    }
+
+    #[test]
+    fn test_evaluate_schema_contract_nullable_violation() {
+        let contract = SchemaContract {
+            required_columns: vec![RequiredColumn {
+                name: "order_id".to_string(),
+                data_type: "Int64".to_string(),
+                nullable: false, // Required non-nullable
+            }],
+            allow_additional_columns: true,
+        };
+
+        let fields = vec![FieldInfo {
+            name: "order_id".to_string(),
+            data_type: "Int64".to_string(),
+            nullable: true, // But field is nullable
+        }];
+
+        let violations = evaluate_schema_contract(&contract, &fields);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("nullable"));
+    }
+
+    #[test]
+    fn test_evaluate_schema_contract_no_additional_columns() {
+        let contract = SchemaContract {
+            required_columns: vec![RequiredColumn {
+                name: "order_id".to_string(),
+                data_type: "Int64".to_string(),
+                nullable: false,
+            }],
+            allow_additional_columns: false, // No extra columns allowed
+        };
+
+        let fields = vec![
+            FieldInfo {
+                name: "order_id".to_string(),
+                data_type: "Int64".to_string(),
+                nullable: false,
+            },
+            FieldInfo {
+                name: "extra_field".to_string(),
+                data_type: "Utf8".to_string(),
+                nullable: true,
+            },
+        ];
+
+        let violations = evaluate_schema_contract(&contract, &fields);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("Unexpected column"));
+        assert!(violations[0].contains("extra_field"));
+    }
+
+    #[test]
+    fn test_types_compatible() {
+        // Exact match
+        assert!(types_compatible("Int64", "Int64"));
+        assert!(types_compatible("Utf8", "Utf8"));
+
+        // Case insensitive
+        assert!(types_compatible("INT64", "int64"));
+
+        // Common aliases
+        assert!(types_compatible("String", "Utf8"));
+        assert!(types_compatible("bigint", "Int64"));
+        assert!(types_compatible("double", "Float64"));
+        assert!(types_compatible("boolean", "bool"));
+        assert!(types_compatible("timestamp[us]", "timestamp"));
+
+        // Incompatible
+        assert!(!types_compatible("Int64", "Utf8"));
+        assert!(!types_compatible("Float64", "Int64"));
+    }
+
+    #[test]
+    fn test_evaluate_quality_contract_pass() {
+        let contract = QualityContract {
+            min_completeness: Some(0.90),
+            min_freshness: Some(0.80),
+            min_overall: Some(0.85),
+        };
+
+        let metrics = QualityMetrics {
+            completeness_score: Some(0.95),
+            freshness_score: Some(0.90),
+            overall_score: Some(0.92),
+            staleness_secs: None,
+        };
+
+        let violations = evaluate_quality_contract(&contract, &metrics);
+        assert!(
+            violations.is_empty(),
+            "Expected no violations: {:?}",
+            violations
+        );
+    }
+
+    #[test]
+    fn test_evaluate_quality_contract_completeness_violation() {
+        let contract = QualityContract {
+            min_completeness: Some(0.95),
+            min_freshness: None,
+            min_overall: None,
+        };
+
+        let metrics = QualityMetrics {
+            completeness_score: Some(0.85), // Below threshold
+            freshness_score: None,
+            overall_score: None,
+            staleness_secs: None,
+        };
+
+        let violations = evaluate_quality_contract(&contract, &metrics);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("Completeness"));
+        assert!(violations[0].contains("85.0%"));
+    }
+
+    #[test]
+    fn test_evaluate_quality_contract_missing_metrics() {
+        let contract = QualityContract {
+            min_completeness: Some(0.90),
+            min_freshness: None,
+            min_overall: None,
+        };
+
+        let metrics = QualityMetrics {
+            completeness_score: None, // Missing!
+            freshness_score: None,
+            overall_score: None,
+            staleness_secs: None,
+        };
+
+        let violations = evaluate_quality_contract(&contract, &metrics);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("not available"));
+    }
+
+    #[test]
+    fn test_evaluate_freshness_contract_pass() {
+        let contract = FreshnessContract {
+            max_staleness_secs: 3600,           // 1 hour
+            expected_interval_secs: Some(1800), // 30 minutes
+        };
+
+        let metrics = QualityMetrics {
+            completeness_score: None,
+            freshness_score: None,
+            overall_score: None,
+            staleness_secs: Some(1200), // 20 minutes - within threshold
+        };
+
+        let violations = evaluate_freshness_contract(&contract, &metrics);
+        assert!(
+            violations.is_empty(),
+            "Expected no violations: {:?}",
+            violations
+        );
+    }
+
+    #[test]
+    fn test_evaluate_freshness_contract_staleness_violation() {
+        let contract = FreshnessContract {
+            max_staleness_secs: 3600, // 1 hour
+            expected_interval_secs: None,
+        };
+
+        let metrics = QualityMetrics {
+            completeness_score: None,
+            freshness_score: None,
+            overall_score: None,
+            staleness_secs: Some(7200), // 2 hours - exceeds threshold
+        };
+
+        let violations = evaluate_freshness_contract(&contract, &metrics);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("staleness"));
+        assert!(violations[0].contains("2 hours"));
+    }
+
+    #[test]
+    fn test_evaluate_freshness_contract_interval_violation() {
+        let contract = FreshnessContract {
+            max_staleness_secs: 86400,          // 24 hours (high threshold)
+            expected_interval_secs: Some(3600), // 1 hour expected
+        };
+
+        let metrics = QualityMetrics {
+            completeness_score: None,
+            freshness_score: None,
+            overall_score: None,
+            staleness_secs: Some(10800), // 3 hours - 3x expected interval
+        };
+
+        let violations = evaluate_freshness_contract(&contract, &metrics);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("update periods"));
+    }
+
+    #[test]
+    fn test_enforcement_action_should_block() {
+        assert!(!EnforcementAction::Allow.should_block());
+        assert!(!EnforcementAction::Warn(vec!["test".to_string()]).should_block());
+        assert!(!EnforcementAction::Alert(vec!["test".to_string()]).should_block());
+        assert!(EnforcementAction::Block(vec!["test".to_string()]).should_block());
+    }
+
+    #[test]
+    fn test_enforcement_action_violations() {
+        assert!(EnforcementAction::Allow.violations().is_none());
+
+        let violations = vec!["v1".to_string(), "v2".to_string()];
+        assert_eq!(
+            EnforcementAction::Warn(violations.clone()).violations(),
+            Some(violations.as_slice())
+        );
+    }
+
+    #[test]
+    fn test_contract_evaluator_full() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        metafuse_catalog_core::init_sqlite_schema(&conn).unwrap();
+        metafuse_catalog_core::migrations::run_migrations(&conn).unwrap();
+
+        // Create a dataset
+        conn.execute(
+            "INSERT INTO datasets (name, path, format, created_at, last_updated) VALUES ('orders', '/data/orders', 'delta', datetime('now'), datetime('now'))",
+            [],
+        ).unwrap();
+
+        let dataset_id: i64 = conn.last_insert_rowid();
+
+        // Add fields
+        conn.execute(
+            "INSERT INTO fields (dataset_id, name, data_type, nullable) VALUES (?1, 'order_id', 'Int64', 0)",
+            [dataset_id],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO fields (dataset_id, name, data_type, nullable) VALUES (?1, 'amount', 'Float64', 1)",
+            [dataset_id],
+        ).unwrap();
+
+        // Create a contract that the dataset should pass
+        let passing_contract = DataContract {
+            id: None,
+            name: "orders_contract".to_string(),
+            dataset_pattern: "orders".to_string(),
+            version: 1,
+            schema_contract: Some(SchemaContract {
+                required_columns: vec![RequiredColumn {
+                    name: "order_id".to_string(),
+                    data_type: "Int64".to_string(),
+                    nullable: false,
+                }],
+                allow_additional_columns: true,
+            }),
+            quality_contract: None,
+            freshness_contract: None,
+            on_violation: OnViolation::Alert,
+            alert_channels: vec![],
+            enabled: true,
+        };
+
+        create_contract(&conn, &passing_contract).unwrap();
+
+        // Evaluate
+        let evaluator = ContractEvaluator::new(&conn);
+        let ctx = DatasetContext {
+            id: dataset_id,
+            name: "orders".to_string(),
+            tenant_id: None,
+        };
+
+        let results = evaluator.evaluate_for_dataset(&ctx).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].passed,
+            "Contract should pass: {:?}",
+            results[0].violations
+        );
+    }
+
+    #[test]
+    fn test_contract_evaluator_with_violation() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        metafuse_catalog_core::init_sqlite_schema(&conn).unwrap();
+        metafuse_catalog_core::migrations::run_migrations(&conn).unwrap();
+
+        // Create a dataset without required field
+        conn.execute(
+            "INSERT INTO datasets (name, path, format, created_at, last_updated) VALUES ('incomplete', '/data/incomplete', 'delta', datetime('now'), datetime('now'))",
+            [],
+        ).unwrap();
+
+        let dataset_id: i64 = conn.last_insert_rowid();
+
+        // Add only one field
+        conn.execute(
+            "INSERT INTO fields (dataset_id, name, data_type, nullable) VALUES (?1, 'amount', 'Float64', 1)",
+            [dataset_id],
+        ).unwrap();
+
+        // Create contract requiring order_id
+        let contract = DataContract {
+            id: None,
+            name: "strict_contract".to_string(),
+            dataset_pattern: "incomplete".to_string(),
+            version: 1,
+            schema_contract: Some(SchemaContract {
+                required_columns: vec![RequiredColumn {
+                    name: "order_id".to_string(),
+                    data_type: "Int64".to_string(),
+                    nullable: false,
+                }],
+                allow_additional_columns: true,
+            }),
+            quality_contract: None,
+            freshness_contract: None,
+            on_violation: OnViolation::Block,
+            alert_channels: vec![],
+            enabled: true,
+        };
+
+        create_contract(&conn, &contract).unwrap();
+
+        // Evaluate
+        let evaluator = ContractEvaluator::new(&conn);
+        let ctx = DatasetContext {
+            id: dataset_id,
+            name: "incomplete".to_string(),
+            tenant_id: None,
+        };
+
+        let results = evaluator.evaluate_for_dataset(&ctx).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].passed, "Contract should fail");
+        assert!(results[0].violations[0].contains("Missing required column"));
+
+        // Check enforcement
+        let action = evaluator.determine_enforcement(&contract, &results[0].violations);
+        assert!(action.should_block());
     }
 }

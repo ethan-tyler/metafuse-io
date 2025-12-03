@@ -366,8 +366,8 @@ impl WebhookClient {
 
     /// Send alert payload to a webhook URL
     pub async fn send(&self, url: &str, payload: &AlertPayload) -> Result<(), WebhookError> {
+        #[cfg(feature = "metrics")]
         let start = std::time::Instant::now();
-        let alert_type = payload.alert_type.as_str();
 
         let response = self
             .client
@@ -377,12 +377,13 @@ impl WebhookClient {
             .await
             .map_err(|e| WebhookError::Network(e.to_string()))?;
 
-        let duration = start.elapsed().as_secs_f64();
         let status_code = response.status().as_u16();
 
-        // Record metrics
+        // Record metrics (variables only computed when feature is enabled)
         #[cfg(feature = "metrics")]
         {
+            let alert_type = payload.alert_type.as_str();
+            let duration = start.elapsed().as_secs_f64();
             metrics::record_webhook_request(status_code, alert_type);
             metrics::record_webhook_duration(alert_type, duration);
         }
@@ -640,6 +641,144 @@ pub fn find_stale_datasets(
     Ok(results)
 }
 
+/// Info for a quality check failure that needs alerting
+#[derive(Debug, Clone)]
+pub struct QualityAlertInfo {
+    pub dataset_id: i64,
+    pub dataset_name: String,
+    pub tenant_id: Option<String>,
+    pub check_id: String,
+    pub check_name: String,
+    pub check_type: String,
+    pub status: String,
+    pub score: Option<f64>,
+    pub threshold: Option<f64>,
+    pub error_message: Option<String>,
+    pub alert_channels: Option<String>,
+}
+
+/// Find quality check failures that need alerting
+/// Returns recent failed/error results that haven't been alerted recently
+pub fn find_quality_failures(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<QualityAlertInfo>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            d.id,
+            d.name,
+            d.tenant,
+            qc.id,
+            qc.name,
+            qc.check_type,
+            qr.status,
+            qr.score,
+            qc.threshold,
+            qr.error_message,
+            qc.alert_channels
+        FROM quality_results qr
+        JOIN quality_checks qc ON qr.check_id = qc.id
+        JOIN datasets d ON qc.dataset_id = d.id
+        WHERE qr.status IN ('Failed', 'Error')
+          AND qc.enabled = 1
+          AND qc.alert_channels IS NOT NULL
+          AND qr.executed_at > datetime('now', '-1 hour')
+        ORDER BY qr.executed_at DESC
+        "#,
+    )?;
+
+    let results = stmt
+        .query_map([], |row| {
+            Ok(QualityAlertInfo {
+                dataset_id: row.get(0)?,
+                dataset_name: row.get(1)?,
+                tenant_id: row.get(2)?,
+                check_id: row.get(3)?,
+                check_name: row.get(4)?,
+                check_type: row.get(5)?,
+                status: row.get(6)?,
+                score: row.get(7)?,
+                threshold: row.get(8)?,
+                error_message: row.get(9)?,
+                alert_channels: row.get(10)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(results)
+}
+
+/// Info for a freshness violation that needs alerting
+#[derive(Debug, Clone)]
+pub struct FreshnessViolationAlertInfo {
+    pub violation_id: String,
+    pub dataset_id: i64,
+    pub dataset_name: String,
+    pub tenant_id: Option<String>,
+    pub expected_by: String,
+    pub detected_at: String,
+    pub sla: String,
+    pub hours_overdue: Option<f64>,
+    pub alert_channels: Option<String>,
+}
+
+/// Find freshness violations that haven't been alerted yet
+pub fn find_unalerted_freshness_violations(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<FreshnessViolationAlertInfo>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            fv.id,
+            fv.dataset_id,
+            d.name,
+            d.tenant,
+            fv.expected_by,
+            fv.detected_at,
+            fv.sla,
+            fv.hours_overdue,
+            fc.alert_channels
+        FROM freshness_violations fv
+        JOIN datasets d ON fv.dataset_id = d.id
+        LEFT JOIN freshness_config fc ON d.id = fc.dataset_id
+        WHERE fv.alert_sent = 0
+          AND fv.resolved_at IS NULL
+        ORDER BY fv.detected_at ASC
+        "#,
+    )?;
+
+    let results = stmt
+        .query_map([], |row| {
+            Ok(FreshnessViolationAlertInfo {
+                violation_id: row.get(0)?,
+                dataset_id: row.get(1)?,
+                dataset_name: row.get(2)?,
+                tenant_id: row.get(3)?,
+                expected_by: row.get(4)?,
+                detected_at: row.get(5)?,
+                sla: row.get(6)?,
+                hours_overdue: row.get(7)?,
+                alert_channels: row.get(8)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(results)
+}
+
+/// Mark a freshness violation as alerted
+pub fn mark_freshness_violation_alerted(
+    conn: &rusqlite::Connection,
+    violation_id: &str,
+    alert_id: i64,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE freshness_violations SET alert_sent = 1, alert_id = ?1 WHERE id = ?2",
+        rusqlite::params![alert_id.to_string(), violation_id],
+    )?;
+    Ok(())
+}
+
 // =============================================================================
 // Background Task
 // =============================================================================
@@ -835,6 +974,321 @@ pub async fn alert_check_task(
                         }
                     }
                 }
+
+                // =================================================================
+                // Process Quality Check Failures
+                // =================================================================
+                let quality_failures = match find_quality_failures(&conn) {
+                    Ok(failures) => failures,
+                    Err(e) => {
+                        error!(error = %e, "Failed to query quality failures");
+                        vec![]
+                    }
+                };
+
+                for qf in quality_failures {
+                    // Check cooldown - use check_id as part of message to differentiate
+                    let has_recent = match has_recent_alert(
+                        &conn,
+                        AlertType::Quality,
+                        qf.dataset_id,
+                        cooldown,
+                    ) {
+                        Ok(has) => has,
+                        Err(e) => {
+                            error!(
+                                dataset_id = qf.dataset_id,
+                                check_id = qf.check_id,
+                                error = %e,
+                                "Failed to check alert cooldown"
+                            );
+                            continue;
+                        }
+                    };
+
+                    if has_recent {
+                        debug!(
+                            dataset_id = qf.dataset_id,
+                            check_name = qf.check_name,
+                            "Skipping quality alert due to cooldown"
+                        );
+                        continue;
+                    }
+
+                    // Create quality alert payload
+                    let score = qf.score.unwrap_or(0.0);
+                    let threshold = qf.threshold.unwrap_or(0.9);
+                    let payload = AlertPayload::quality(
+                        &qf.dataset_name,
+                        qf.dataset_id,
+                        score,
+                        threshold,
+                        &qf.check_type,
+                    );
+
+                    // Parse alert channels
+                    let channels: Vec<String> = qf
+                        .alert_channels
+                        .as_ref()
+                        .and_then(|c| serde_json::from_str(c).ok())
+                        .unwrap_or_default();
+
+                    if channels.is_empty() {
+                        debug!(
+                            dataset_id = qf.dataset_id,
+                            check_name = qf.check_name,
+                            "No alert channels configured, skipping"
+                        );
+                        continue;
+                    }
+
+                    // Record alert
+                    let alert_id = match record_alert(
+                        &conn,
+                        AlertType::Quality,
+                        Some(qf.dataset_id),
+                        payload.severity,
+                        &payload.message,
+                        payload.details.as_ref().map(|d| d.to_string()).as_deref(),
+                        qf.alert_channels.as_deref(),
+                        qf.tenant_id.as_deref(),
+                    ) {
+                        Ok(id) => {
+                            #[cfg(feature = "metrics")]
+                            metrics::record_alert_fired(
+                                AlertType::Quality.as_str(),
+                                payload.severity.as_str(),
+                            );
+                            id
+                        }
+                        Err(e) => {
+                            error!(
+                                dataset_id = qf.dataset_id,
+                                check_name = qf.check_name,
+                                error = %e,
+                                "Failed to record quality alert"
+                            );
+                            continue;
+                        }
+                    };
+
+                    let payload = payload.with_alert_history_id(alert_id);
+
+                    // Deliver to channels
+                    let mut delivery_success = true;
+                    let mut total_attempts = 0;
+                    let mut last_error: Option<String> = None;
+
+                    for channel in &channels {
+                        let url = channel.strip_prefix("webhook:").unwrap_or(channel);
+                        let redacted = redact_url(url);
+
+                        match webhook_client
+                            .send_with_retry(url, &payload, MAX_DELIVERY_ATTEMPTS)
+                            .await
+                        {
+                            Ok(attempts) => {
+                                total_attempts += attempts;
+                                info!(
+                                    alert_id,
+                                    check_name = qf.check_name,
+                                    dataset_name = qf.dataset_name,
+                                    webhook_url = %redacted,
+                                    attempts,
+                                    "Quality alert delivered successfully"
+                                );
+                            }
+                            Err(e) => {
+                                total_attempts += MAX_DELIVERY_ATTEMPTS;
+                                delivery_success = false;
+                                last_error = Some(e.to_string());
+                                error!(
+                                    alert_id,
+                                    check_name = qf.check_name,
+                                    webhook_url = %redacted,
+                                    error = %e,
+                                    "Quality alert delivery failed"
+                                );
+                            }
+                        }
+                    }
+
+                    // Update delivery status
+                    let status = if delivery_success {
+                        "delivered"
+                    } else {
+                        "failed"
+                    };
+                    if let Err(e) = update_delivery_status(
+                        &conn,
+                        alert_id,
+                        status,
+                        total_attempts as i32,
+                        last_error.as_deref(),
+                    ) {
+                        error!(alert_id, error = %e, "Failed to update delivery status");
+                    }
+
+                    #[cfg(feature = "metrics")]
+                    {
+                        if delivery_success {
+                            metrics::record_alert_delivered(AlertType::Quality.as_str());
+                        } else {
+                            metrics::record_alert_delivery_failed(AlertType::Quality.as_str());
+                        }
+                    }
+                }
+
+                // =================================================================
+                // Process Freshness Violations (from freshness_violations table)
+                // =================================================================
+                let violations = match find_unalerted_freshness_violations(&conn) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!(error = %e, "Failed to query freshness violations");
+                        vec![]
+                    }
+                };
+
+                for violation in violations {
+                    // Calculate staleness from expected_by
+                    let staleness_secs = violation
+                        .hours_overdue
+                        .map(|h| (h * 3600.0) as i64)
+                        .unwrap_or(0);
+
+                    // Create freshness alert payload
+                    let payload = AlertPayload::freshness(
+                        &violation.dataset_name,
+                        violation.dataset_id,
+                        staleness_secs,
+                        3600, // Default expected interval
+                    );
+
+                    // Parse alert channels
+                    let channels: Vec<String> = violation
+                        .alert_channels
+                        .as_ref()
+                        .and_then(|c| serde_json::from_str(c).ok())
+                        .unwrap_or_default();
+
+                    if channels.is_empty() {
+                        debug!(
+                            violation_id = violation.violation_id,
+                            dataset_name = violation.dataset_name,
+                            "No alert channels configured for violation, skipping"
+                        );
+                        // Still mark as alerted to prevent repeated processing
+                        let _ = mark_freshness_violation_alerted(&conn, &violation.violation_id, 0);
+                        continue;
+                    }
+
+                    // Record alert
+                    let alert_id = match record_alert(
+                        &conn,
+                        AlertType::Freshness,
+                        Some(violation.dataset_id),
+                        payload.severity,
+                        &payload.message,
+                        payload.details.as_ref().map(|d| d.to_string()).as_deref(),
+                        violation.alert_channels.as_deref(),
+                        violation.tenant_id.as_deref(),
+                    ) {
+                        Ok(id) => {
+                            #[cfg(feature = "metrics")]
+                            metrics::record_alert_fired(
+                                AlertType::Freshness.as_str(),
+                                payload.severity.as_str(),
+                            );
+                            id
+                        }
+                        Err(e) => {
+                            error!(
+                                violation_id = violation.violation_id,
+                                error = %e,
+                                "Failed to record freshness violation alert"
+                            );
+                            continue;
+                        }
+                    };
+
+                    // Mark violation as alerted
+                    if let Err(e) =
+                        mark_freshness_violation_alerted(&conn, &violation.violation_id, alert_id)
+                    {
+                        error!(
+                            violation_id = violation.violation_id,
+                            error = %e,
+                            "Failed to mark violation as alerted"
+                        );
+                    }
+
+                    let payload = payload.with_alert_history_id(alert_id);
+
+                    // Deliver to channels
+                    let mut delivery_success = true;
+                    let mut total_attempts = 0;
+                    let mut last_error: Option<String> = None;
+
+                    for channel in &channels {
+                        let url = channel.strip_prefix("webhook:").unwrap_or(channel);
+                        let redacted = redact_url(url);
+
+                        match webhook_client
+                            .send_with_retry(url, &payload, MAX_DELIVERY_ATTEMPTS)
+                            .await
+                        {
+                            Ok(attempts) => {
+                                total_attempts += attempts;
+                                info!(
+                                    alert_id,
+                                    violation_id = violation.violation_id,
+                                    dataset_name = violation.dataset_name,
+                                    webhook_url = %redacted,
+                                    attempts,
+                                    "Freshness violation alert delivered successfully"
+                                );
+                            }
+                            Err(e) => {
+                                total_attempts += MAX_DELIVERY_ATTEMPTS;
+                                delivery_success = false;
+                                last_error = Some(e.to_string());
+                                error!(
+                                    alert_id,
+                                    violation_id = violation.violation_id,
+                                    webhook_url = %redacted,
+                                    error = %e,
+                                    "Freshness violation alert delivery failed"
+                                );
+                            }
+                        }
+                    }
+
+                    // Update delivery status
+                    let status = if delivery_success {
+                        "delivered"
+                    } else {
+                        "failed"
+                    };
+                    if let Err(e) = update_delivery_status(
+                        &conn,
+                        alert_id,
+                        status,
+                        total_attempts as i32,
+                        last_error.as_deref(),
+                    ) {
+                        error!(alert_id, error = %e, "Failed to update delivery status");
+                    }
+
+                    #[cfg(feature = "metrics")]
+                    {
+                        if delivery_success {
+                            metrics::record_alert_delivered(AlertType::Freshness.as_str());
+                        } else {
+                            metrics::record_alert_delivery_failed(AlertType::Freshness.as_str());
+                        }
+                    }
+                }
             }
             Err(e) => {
                 warn!(error = %e, "Failed to get connection for alert check");
@@ -1020,6 +1474,526 @@ pub fn query_alert_history(
         limit,
         has_more,
     })
+}
+
+// =============================================================================
+// Schema Change Detection (v0.11.0)
+// =============================================================================
+
+/// Configuration for schema change monitoring
+#[derive(Debug, Clone)]
+pub struct SchemaMonitorConfig {
+    /// How often to check for schema changes (seconds)
+    pub check_interval_secs: u64,
+    /// Whether schema monitoring is enabled
+    pub enabled: bool,
+    /// Cooldown between re-alerting same dataset (seconds)
+    pub cooldown_secs: i64,
+}
+
+impl Default for SchemaMonitorConfig {
+    fn default() -> Self {
+        Self {
+            check_interval_secs: 300, // Check every 5 minutes
+            enabled: true,
+            cooldown_secs: ALERT_COOLDOWN_SECS,
+        }
+    }
+}
+
+/// Information about a dataset that needs schema monitoring
+#[derive(Debug, Clone)]
+pub struct SchemaMonitorTarget {
+    pub dataset_id: i64,
+    pub dataset_name: String,
+    pub tenant_id: Option<String>,
+    pub delta_location: String,
+    pub alert_channels: Option<String>,
+}
+
+/// Find datasets with delta_location that need schema monitoring
+pub fn find_datasets_for_schema_check(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<SchemaMonitorTarget>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            d.id,
+            d.name,
+            d.tenant,
+            d.delta_location,
+            fc.alert_channels
+        FROM datasets d
+        LEFT JOIN freshness_config fc ON d.id = fc.dataset_id
+        WHERE d.delta_location IS NOT NULL
+          AND d.delta_location != ''
+        "#,
+    )?;
+
+    let results = stmt
+        .query_map([], |row| {
+            Ok(SchemaMonitorTarget {
+                dataset_id: row.get(0)?,
+                dataset_name: row.get(1)?,
+                tenant_id: row.get(2)?,
+                delta_location: row.get(3)?,
+                alert_channels: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(results)
+}
+
+/// Schema of a field from the catalog's fields table
+#[derive(Debug, Clone)]
+pub struct CatalogField {
+    pub name: String,
+    pub data_type: String,
+    pub nullable: bool,
+}
+
+/// Get the current schema for a dataset from the fields table
+pub fn get_catalog_schema(
+    conn: &rusqlite::Connection,
+    dataset_id: i64,
+) -> Result<Vec<CatalogField>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT name, data_type, nullable FROM fields WHERE dataset_id = ?1 ORDER BY name",
+    )?;
+
+    let fields = stmt
+        .query_map([dataset_id], |row| {
+            Ok(CatalogField {
+                name: row.get(0)?,
+                data_type: row.get(1)?,
+                nullable: row.get::<_, i32>(2)? != 0,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(fields)
+}
+
+/// Information about a detected schema change
+#[derive(Debug, Clone)]
+pub struct SchemaChangeInfo {
+    pub dataset_id: i64,
+    pub dataset_name: String,
+    pub tenant_id: Option<String>,
+    pub alert_channels: Option<String>,
+    pub added_columns: Vec<String>,
+    pub removed_columns: Vec<String>,
+    pub modified_columns: Vec<String>,
+    pub is_breaking: bool,
+}
+
+impl SchemaChangeInfo {
+    /// Check if there are any changes
+    pub fn has_changes(&self) -> bool {
+        !self.added_columns.is_empty()
+            || !self.removed_columns.is_empty()
+            || !self.modified_columns.is_empty()
+    }
+}
+
+/// Update the catalog's fields table to match the Delta schema
+///
+/// This syncs the schema by:
+/// 1. Deleting fields that no longer exist
+/// 2. Adding new fields
+/// 3. Updating fields that changed type/nullability
+pub fn sync_catalog_schema(
+    conn: &rusqlite::Connection,
+    dataset_id: i64,
+    delta_fields: &[metafuse_catalog_delta::Field],
+) -> Result<(), rusqlite::Error> {
+    // Get current catalog fields
+    let current_fields = get_catalog_schema(conn, dataset_id)?;
+    let current_map: std::collections::HashMap<_, _> =
+        current_fields.iter().map(|f| (f.name.clone(), f)).collect();
+
+    let delta_map: std::collections::HashMap<_, _> =
+        delta_fields.iter().map(|f| (f.name.clone(), f)).collect();
+
+    // Delete removed fields
+    for field in &current_fields {
+        if !delta_map.contains_key(&field.name) {
+            conn.execute(
+                "DELETE FROM fields WHERE dataset_id = ?1 AND name = ?2",
+                rusqlite::params![dataset_id, field.name],
+            )?;
+        }
+    }
+
+    // Add or update fields
+    for delta_field in delta_fields {
+        if let Some(current) = current_map.get(&delta_field.name) {
+            // Update if changed
+            if current.data_type != delta_field.data_type
+                || current.nullable != delta_field.nullable
+            {
+                conn.execute(
+                    "UPDATE fields SET data_type = ?1, nullable = ?2 WHERE dataset_id = ?3 AND name = ?4",
+                    rusqlite::params![
+                        delta_field.data_type,
+                        delta_field.nullable,
+                        dataset_id,
+                        delta_field.name
+                    ],
+                )?;
+            }
+        } else {
+            // Insert new field
+            conn.execute(
+                "INSERT INTO fields (dataset_id, name, data_type, nullable) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    dataset_id,
+                    delta_field.name,
+                    delta_field.data_type,
+                    delta_field.nullable
+                ],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Compare Delta schema with catalog schema and detect changes
+pub fn detect_schema_changes(
+    catalog_fields: &[CatalogField],
+    delta_fields: &[metafuse_catalog_delta::Field],
+    target: &SchemaMonitorTarget,
+) -> SchemaChangeInfo {
+    let catalog_map: std::collections::HashMap<_, _> =
+        catalog_fields.iter().map(|f| (f.name.clone(), f)).collect();
+
+    let delta_map: std::collections::HashMap<_, _> =
+        delta_fields.iter().map(|f| (f.name.clone(), f)).collect();
+
+    // Find added columns (in Delta but not in catalog)
+    let added_columns: Vec<String> = delta_fields
+        .iter()
+        .filter(|f| !catalog_map.contains_key(&f.name))
+        .map(|f| f.name.clone())
+        .collect();
+
+    // Find removed columns (in catalog but not in Delta)
+    let removed_columns: Vec<String> = catalog_fields
+        .iter()
+        .filter(|f| !delta_map.contains_key(&f.name))
+        .map(|f| f.name.clone())
+        .collect();
+
+    // Find modified columns (type or nullability changed)
+    let modified_columns: Vec<String> = catalog_fields
+        .iter()
+        .filter_map(|cf| {
+            delta_map.get(&cf.name).and_then(|df| {
+                if cf.data_type != df.data_type || cf.nullable != df.nullable {
+                    Some(format!(
+                        "{} ({} -> {})",
+                        cf.name, cf.data_type, df.data_type
+                    ))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    // Breaking changes: columns removed or types changed in incompatible ways
+    let is_breaking = !removed_columns.is_empty() || !modified_columns.is_empty();
+
+    SchemaChangeInfo {
+        dataset_id: target.dataset_id,
+        dataset_name: target.dataset_name.clone(),
+        tenant_id: target.tenant_id.clone(),
+        alert_channels: target.alert_channels.clone(),
+        added_columns,
+        removed_columns,
+        modified_columns,
+        is_breaking,
+    }
+}
+
+/// Background task that monitors Delta tables for schema changes
+///
+/// This task:
+/// 1. Periodically queries datasets with delta_location
+/// 2. Compares current Delta schema with catalog schema (fields table)
+/// 3. Detects changes (added, removed, modified columns)
+/// 4. Fires schema change alerts
+/// 5. Updates catalog to reflect new schema
+#[cfg(feature = "alerting")]
+pub async fn schema_monitor_task(
+    delta_reader: Arc<metafuse_catalog_delta::DeltaReader>,
+    webhook_client: Arc<WebhookClient>,
+    backend: Arc<metafuse_catalog_storage::DynCatalogBackend>,
+    config: SchemaMonitorConfig,
+) {
+    let interval = Duration::from_secs(config.check_interval_secs);
+
+    info!(
+        interval_secs = config.check_interval_secs,
+        "Schema monitor task started"
+    );
+
+    loop {
+        tokio::time::sleep(interval).await;
+
+        if !config.enabled {
+            debug!("Schema monitoring disabled, skipping");
+            continue;
+        }
+
+        debug!("Running schema change detection");
+
+        // Phase 1: Get datasets to monitor
+        let targets = match backend.get_connection().await {
+            Ok(conn) => match find_datasets_for_schema_check(&conn) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!(error = %e, "Failed to query datasets for schema check");
+                    continue;
+                }
+            },
+            Err(e) => {
+                warn!(error = %e, "Failed to get connection for schema check");
+                continue;
+            }
+        };
+
+        if targets.is_empty() {
+            debug!("No datasets with delta_location to monitor");
+            continue;
+        }
+
+        debug!(
+            count = targets.len(),
+            "Checking datasets for schema changes"
+        );
+
+        // Phase 2: Check each dataset for schema changes
+        for target in targets {
+            // Get current Delta schema
+            let delta_schema = match delta_reader.get_schema(&target.delta_location, None).await {
+                Ok(schema) => schema,
+                Err(e) => {
+                    debug!(
+                        dataset_id = target.dataset_id,
+                        dataset_name = %target.dataset_name,
+                        error = %e,
+                        "Failed to get Delta schema, skipping"
+                    );
+                    continue;
+                }
+            };
+
+            // Get catalog schema and compare
+            let conn = match backend.get_connection().await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(error = %e, "Failed to get connection");
+                    continue;
+                }
+            };
+
+            let catalog_fields = match get_catalog_schema(&conn, target.dataset_id) {
+                Ok(f) => f,
+                Err(e) => {
+                    error!(
+                        dataset_id = target.dataset_id,
+                        error = %e,
+                        "Failed to get catalog schema"
+                    );
+                    continue;
+                }
+            };
+
+            // If catalog has no fields, this is initial sync, not a change
+            if catalog_fields.is_empty() {
+                debug!(
+                    dataset_id = target.dataset_id,
+                    dataset_name = %target.dataset_name,
+                    "No catalog schema yet, syncing initial schema"
+                );
+                if let Err(e) = sync_catalog_schema(&conn, target.dataset_id, &delta_schema.fields)
+                {
+                    error!(
+                        dataset_id = target.dataset_id,
+                        error = %e,
+                        "Failed to sync initial schema"
+                    );
+                }
+                continue;
+            }
+
+            // Detect changes
+            let changes = detect_schema_changes(&catalog_fields, &delta_schema.fields, &target);
+
+            if !changes.has_changes() {
+                continue;
+            }
+
+            info!(
+                dataset_id = target.dataset_id,
+                dataset_name = %target.dataset_name,
+                added = ?changes.added_columns,
+                removed = ?changes.removed_columns,
+                modified = ?changes.modified_columns,
+                is_breaking = changes.is_breaking,
+                "Schema change detected"
+            );
+
+            // Check cooldown
+            let has_recent = match has_recent_alert(
+                &conn,
+                AlertType::Schema,
+                target.dataset_id,
+                config.cooldown_secs,
+            ) {
+                Ok(has) => has,
+                Err(e) => {
+                    error!(error = %e, "Failed to check alert cooldown");
+                    false
+                }
+            };
+
+            if has_recent {
+                debug!(
+                    dataset_id = target.dataset_id,
+                    "Skipping schema alert due to cooldown"
+                );
+                // Still sync schema even if we don't alert
+                let _ = sync_catalog_schema(&conn, target.dataset_id, &delta_schema.fields);
+                continue;
+            }
+
+            // Create alert payload
+            let payload = AlertPayload::schema_change(
+                &changes.dataset_name,
+                changes.dataset_id,
+                &changes.added_columns,
+                &changes.removed_columns,
+                &changes.modified_columns,
+            );
+
+            // Parse alert channels
+            let channels: Vec<String> = changes
+                .alert_channels
+                .as_ref()
+                .and_then(|c| serde_json::from_str(c).ok())
+                .unwrap_or_default();
+
+            // Record alert even if no channels configured
+            let alert_id = match record_alert(
+                &conn,
+                AlertType::Schema,
+                Some(changes.dataset_id),
+                payload.severity,
+                &payload.message,
+                payload.details.as_ref().map(|d| d.to_string()).as_deref(),
+                changes.alert_channels.as_deref(),
+                changes.tenant_id.as_deref(),
+            ) {
+                Ok(id) => {
+                    #[cfg(feature = "metrics")]
+                    metrics::record_alert_fired(
+                        AlertType::Schema.as_str(),
+                        payload.severity.as_str(),
+                    );
+                    id
+                }
+                Err(e) => {
+                    error!(
+                        dataset_id = changes.dataset_id,
+                        error = %e,
+                        "Failed to record schema change alert"
+                    );
+                    // Still sync schema
+                    let _ = sync_catalog_schema(&conn, target.dataset_id, &delta_schema.fields);
+                    continue;
+                }
+            };
+
+            // Deliver to webhook channels if configured
+            if !channels.is_empty() {
+                let payload = payload.with_alert_history_id(alert_id);
+                let mut delivery_success = true;
+                let mut total_attempts = 0;
+                let mut last_error: Option<String> = None;
+
+                for channel in &channels {
+                    let url = channel.strip_prefix("webhook:").unwrap_or(channel);
+                    let redacted = redact_url(url);
+
+                    match webhook_client
+                        .send_with_retry(url, &payload, MAX_DELIVERY_ATTEMPTS)
+                        .await
+                    {
+                        Ok(attempts) => {
+                            total_attempts += attempts;
+                            info!(
+                                alert_id,
+                                dataset_name = %changes.dataset_name,
+                                webhook_url = %redacted,
+                                attempts,
+                                "Schema change alert delivered successfully"
+                            );
+                        }
+                        Err(e) => {
+                            total_attempts += MAX_DELIVERY_ATTEMPTS;
+                            delivery_success = false;
+                            last_error = Some(e.to_string());
+                            error!(
+                                alert_id,
+                                dataset_name = %changes.dataset_name,
+                                webhook_url = %redacted,
+                                error = %e,
+                                "Schema change alert delivery failed"
+                            );
+                        }
+                    }
+                }
+
+                // Update delivery status
+                let status = if delivery_success {
+                    "delivered"
+                } else {
+                    "failed"
+                };
+                if let Err(e) = update_delivery_status(
+                    &conn,
+                    alert_id,
+                    status,
+                    total_attempts as i32,
+                    last_error.as_deref(),
+                ) {
+                    error!(alert_id, error = %e, "Failed to update delivery status");
+                }
+
+                #[cfg(feature = "metrics")]
+                {
+                    if delivery_success {
+                        metrics::record_alert_delivered(AlertType::Schema.as_str());
+                    } else {
+                        metrics::record_alert_delivery_failed(AlertType::Schema.as_str());
+                    }
+                }
+            }
+
+            // Sync catalog schema to reflect changes
+            if let Err(e) = sync_catalog_schema(&conn, target.dataset_id, &delta_schema.fields) {
+                error!(
+                    dataset_id = target.dataset_id,
+                    error = %e,
+                    "Failed to sync schema after change detection"
+                );
+            }
+        }
+    }
 }
 
 // =============================================================================

@@ -63,6 +63,267 @@ pub struct FieldMeta {
     pub description: Option<String>,
 }
 
+// ============================================================================
+// Quality Check Types
+// ============================================================================
+
+/// Type of quality check
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityCheckType {
+    /// Check for null/missing values
+    Completeness,
+    /// Check data conforms to expected patterns
+    Validity,
+    /// Check for duplicate values
+    Uniqueness,
+    /// Check data is up-to-date
+    Freshness,
+    /// User-defined SQL-based check
+    Custom,
+}
+
+impl std::fmt::Display for QualityCheckType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QualityCheckType::Completeness => write!(f, "completeness"),
+            QualityCheckType::Validity => write!(f, "validity"),
+            QualityCheckType::Uniqueness => write!(f, "uniqueness"),
+            QualityCheckType::Freshness => write!(f, "freshness"),
+            QualityCheckType::Custom => write!(f, "custom"),
+        }
+    }
+}
+
+impl std::str::FromStr for QualityCheckType {
+    type Err = CatalogError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "completeness" => Ok(QualityCheckType::Completeness),
+            "validity" => Ok(QualityCheckType::Validity),
+            "uniqueness" => Ok(QualityCheckType::Uniqueness),
+            "freshness" => Ok(QualityCheckType::Freshness),
+            "custom" => Ok(QualityCheckType::Custom),
+            _ => Err(CatalogError::ValidationError(format!(
+                "Unknown quality check type: {}",
+                s
+            ))),
+        }
+    }
+}
+
+/// Severity level for quality checks
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityCheckSeverity {
+    /// Informational, no action required
+    Info,
+    /// Warning, should be investigated
+    Warning,
+    /// Critical, requires immediate attention
+    Critical,
+}
+
+impl std::fmt::Display for QualityCheckSeverity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QualityCheckSeverity::Info => write!(f, "info"),
+            QualityCheckSeverity::Warning => write!(f, "warning"),
+            QualityCheckSeverity::Critical => write!(f, "critical"),
+        }
+    }
+}
+
+impl std::str::FromStr for QualityCheckSeverity {
+    type Err = CatalogError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "info" => Ok(QualityCheckSeverity::Info),
+            "warning" => Ok(QualityCheckSeverity::Warning),
+            "critical" => Ok(QualityCheckSeverity::Critical),
+            _ => Err(CatalogError::ValidationError(format!(
+                "Unknown severity: {}",
+                s
+            ))),
+        }
+    }
+}
+
+/// A quality check definition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityCheck {
+    /// Unique identifier
+    pub id: String,
+    /// Dataset this check applies to
+    pub dataset_id: i64,
+    /// Type of check
+    pub check_type: QualityCheckType,
+    /// Human-readable name
+    pub check_name: String,
+    /// Optional description
+    pub check_description: Option<String>,
+    /// Check-specific configuration (JSON string)
+    pub check_config: Option<String>,
+    /// Severity level
+    pub severity: QualityCheckSeverity,
+    /// Score threshold for warning (0.0-1.0)
+    pub warn_threshold: Option<f64>,
+    /// Score threshold for failure (0.0-1.0)
+    pub fail_threshold: Option<f64>,
+    /// Whether the check is enabled
+    pub enabled: bool,
+    /// Cron schedule for periodic execution (None = on-demand only)
+    pub schedule: Option<String>,
+    /// Whether to allow on-demand execution
+    pub on_demand: bool,
+    /// When the check was created
+    pub created_at: DateTime<Utc>,
+    /// When the check was last updated
+    pub updated_at: DateTime<Utc>,
+    /// Who created the check
+    pub created_by: Option<String>,
+    /// Tenant identifier (for multi-tenant)
+    pub tenant_id: Option<String>,
+}
+
+/// Status of a quality check execution
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityCheckStatus {
+    /// Check passed
+    Pass,
+    /// Check warned (below warn threshold but above fail)
+    Warn,
+    /// Check failed (below fail threshold)
+    Fail,
+    /// Check encountered an error during execution
+    Error,
+    /// Check was skipped
+    Skipped,
+}
+
+impl std::fmt::Display for QualityCheckStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QualityCheckStatus::Pass => write!(f, "pass"),
+            QualityCheckStatus::Warn => write!(f, "warn"),
+            QualityCheckStatus::Fail => write!(f, "fail"),
+            QualityCheckStatus::Error => write!(f, "error"),
+            QualityCheckStatus::Skipped => write!(f, "skipped"),
+        }
+    }
+}
+
+impl std::str::FromStr for QualityCheckStatus {
+    type Err = CatalogError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "pass" => Ok(QualityCheckStatus::Pass),
+            "warn" => Ok(QualityCheckStatus::Warn),
+            "fail" => Ok(QualityCheckStatus::Fail),
+            "error" => Ok(QualityCheckStatus::Error),
+            "skipped" => Ok(QualityCheckStatus::Skipped),
+            _ => Err(CatalogError::ValidationError(format!(
+                "Unknown check status: {}",
+                s
+            ))),
+        }
+    }
+}
+
+/// Execution mode for a quality check
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityCheckExecutionMode {
+    /// Triggered via API
+    OnDemand,
+    /// Triggered by background scheduler
+    Scheduled,
+}
+
+impl std::fmt::Display for QualityCheckExecutionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QualityCheckExecutionMode::OnDemand => write!(f, "on_demand"),
+            QualityCheckExecutionMode::Scheduled => write!(f, "scheduled"),
+        }
+    }
+}
+
+/// Result of a quality check execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityCheckResult {
+    /// Unique identifier
+    pub id: String,
+    /// Reference to the check definition
+    pub check_id: String,
+    /// Dataset that was checked
+    pub dataset_id: i64,
+    /// Status of the check
+    pub status: QualityCheckStatus,
+    /// Quality score (0.0-1.0), None if error/skipped
+    pub score: Option<f64>,
+    /// Check-specific details (JSON string)
+    pub details: Option<String>,
+    /// Error message if status is Error
+    pub error_message: Option<String>,
+    /// Number of records checked
+    pub records_checked: Option<i64>,
+    /// Number of records that failed the check
+    pub records_failed: Option<i64>,
+    /// When the check was executed
+    pub executed_at: DateTime<Utc>,
+    /// How long the check took (milliseconds)
+    pub execution_time_ms: Option<i64>,
+    /// How the check was triggered
+    pub execution_mode: QualityCheckExecutionMode,
+    /// Delta table version at time of check
+    pub delta_version: Option<i64>,
+}
+
+// ============================================================================
+// Freshness Violation Types
+// ============================================================================
+
+/// A freshness SLA violation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FreshnessViolation {
+    /// Unique identifier
+    pub id: String,
+    /// Dataset that violated its SLA
+    pub dataset_id: i64,
+    /// When the data should have been updated
+    pub expected_by: DateTime<Utc>,
+    /// When the violation was detected
+    pub detected_at: DateTime<Utc>,
+    /// When the data was finally updated (None if still open)
+    pub resolved_at: Option<DateTime<Utc>>,
+    /// The SLA that was breached (e.g., "hourly", "daily")
+    pub sla: String,
+    /// Grace period that was configured (minutes)
+    pub grace_period_minutes: Option<i32>,
+    /// How many hours past the deadline
+    pub hours_overdue: Option<f64>,
+    /// Dataset's last_updated at time of detection
+    pub last_updated_at: Option<DateTime<Utc>>,
+    /// Whether an alert was sent
+    pub alert_sent: bool,
+    /// Reference to alert_history if alert was sent
+    pub alert_id: Option<String>,
+    /// Tenant identifier (for multi-tenant)
+    pub tenant_id: Option<String>,
+}
+
+impl FreshnessViolation {
+    /// Check if this violation is still open (unresolved)
+    pub fn is_open(&self) -> bool {
+        self.resolved_at.is_none()
+    }
+}
+
 /// Errors that can occur in catalog operations
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {

@@ -606,3 +606,374 @@ mod feature_combinations {
         let _ = (AuditAction::Create, AccessType::Read, Classification::Pii);
     }
 }
+
+// =============================================================================
+// Data Contracts (v0.9.0)
+// =============================================================================
+
+#[cfg(feature = "contracts")]
+mod data_contracts {
+    use metafuse_catalog_api::contracts::*;
+
+    #[test]
+    fn test_contract_types_available() {
+        let _ = OnViolation::Alert;
+        let _ = OnViolation::Warn;
+        let _ = OnViolation::Block;
+    }
+
+    #[test]
+    fn test_schema_contract_creation() {
+        let contract = SchemaContract {
+            required_columns: vec![RequiredColumn {
+                name: "order_id".to_string(),
+                data_type: "Int64".to_string(),
+                nullable: false,
+            }],
+            allow_additional_columns: true,
+        };
+
+        assert_eq!(contract.required_columns.len(), 1);
+        assert!(contract.allow_additional_columns);
+    }
+
+    #[test]
+    fn test_quality_contract_creation() {
+        let contract = QualityContract {
+            min_completeness: Some(0.95),
+            min_freshness: Some(0.90),
+            min_overall: Some(0.85),
+        };
+
+        assert_eq!(contract.min_completeness, Some(0.95));
+        assert_eq!(contract.min_freshness, Some(0.90));
+        assert_eq!(contract.min_overall, Some(0.85));
+    }
+
+    #[test]
+    fn test_freshness_contract_creation() {
+        let contract = FreshnessContract {
+            max_staleness_secs: 3600,
+            expected_interval_secs: Some(1800),
+        };
+
+        assert_eq!(contract.max_staleness_secs, 3600);
+        assert_eq!(contract.expected_interval_secs, Some(1800));
+    }
+
+    #[test]
+    fn test_data_contract_creation() {
+        let contract = DataContract {
+            id: None,
+            name: "orders_contract".to_string(),
+            dataset_pattern: "orders*".to_string(),
+            version: 1,
+            schema_contract: Some(SchemaContract {
+                required_columns: vec![],
+                allow_additional_columns: true,
+            }),
+            quality_contract: Some(QualityContract {
+                min_completeness: Some(0.95),
+                min_freshness: None,
+                min_overall: None,
+            }),
+            freshness_contract: Some(FreshnessContract {
+                max_staleness_secs: 3600,
+                expected_interval_secs: None,
+            }),
+            on_violation: OnViolation::Alert,
+            alert_channels: vec!["https://webhook.example.com".to_string()],
+            enabled: true,
+        };
+
+        assert_eq!(contract.name, "orders_contract");
+        assert_eq!(contract.dataset_pattern, "orders*");
+        assert!(contract.schema_contract.is_some());
+        assert!(contract.quality_contract.is_some());
+        assert!(contract.freshness_contract.is_some());
+    }
+
+    #[test]
+    fn test_contract_validation_pass() {
+        let contract = DataContract {
+            id: None,
+            name: "valid_contract".to_string(),
+            dataset_pattern: "*".to_string(),
+            version: 1,
+            schema_contract: None,
+            quality_contract: None,
+            freshness_contract: None,
+            on_violation: OnViolation::Alert,
+            alert_channels: vec![],
+            enabled: true,
+        };
+
+        let errors = validate_contract(&contract);
+        assert!(
+            errors.is_empty(),
+            "Expected no validation errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_contract_validation_fail_empty_name() {
+        let contract = DataContract {
+            id: None,
+            name: "".to_string(),
+            dataset_pattern: "*".to_string(),
+            version: 1,
+            schema_contract: None,
+            quality_contract: None,
+            freshness_contract: None,
+            on_violation: OnViolation::Alert,
+            alert_channels: vec![],
+            enabled: true,
+        };
+
+        let errors = validate_contract(&contract);
+        assert!(!errors.is_empty());
+        assert!(errors.iter().any(|e| e.field == "name"));
+    }
+
+    #[test]
+    fn test_validation_result_types() {
+        let pass = ValidationResult::pass("test_contract", "test_dataset");
+        assert!(pass.passed);
+        assert!(pass.violations.is_empty());
+
+        let fail = ValidationResult::fail(
+            "test_contract",
+            "test_dataset",
+            vec!["Missing column".to_string()],
+        );
+        assert!(!fail.passed);
+        assert_eq!(fail.violations.len(), 1);
+    }
+
+    #[test]
+    fn test_enforcement_action_types() {
+        assert!(!EnforcementAction::Allow.should_block());
+        assert!(!EnforcementAction::Warn(vec!["test".to_string()]).should_block());
+        assert!(!EnforcementAction::Alert(vec!["test".to_string()]).should_block());
+        assert!(EnforcementAction::Block(vec!["test".to_string()]).should_block());
+    }
+
+    #[test]
+    fn test_schema_evaluation_missing_column() {
+        let contract = SchemaContract {
+            required_columns: vec![RequiredColumn {
+                name: "required_col".to_string(),
+                data_type: "Int64".to_string(),
+                nullable: false,
+            }],
+            allow_additional_columns: true,
+        };
+
+        let fields = vec![FieldInfo {
+            name: "other_col".to_string(),
+            data_type: "Int64".to_string(),
+            nullable: false,
+        }];
+
+        let violations = evaluate_schema_contract(&contract, &fields);
+        assert!(!violations.is_empty());
+        assert!(violations[0].contains("Missing required column"));
+    }
+
+    #[test]
+    fn test_quality_evaluation_below_threshold() {
+        let contract = QualityContract {
+            min_completeness: Some(0.95),
+            min_freshness: None,
+            min_overall: None,
+        };
+
+        let metrics = QualityMetrics {
+            completeness_score: Some(0.80),
+            freshness_score: None,
+            overall_score: None,
+            staleness_secs: None,
+        };
+
+        let violations = evaluate_quality_contract(&contract, &metrics);
+        assert!(!violations.is_empty());
+        assert!(violations[0].contains("Completeness"));
+    }
+
+    #[test]
+    fn test_freshness_evaluation_stale() {
+        let contract = FreshnessContract {
+            max_staleness_secs: 3600, // 1 hour
+            expected_interval_secs: None,
+        };
+
+        let metrics = QualityMetrics {
+            completeness_score: None,
+            freshness_score: None,
+            overall_score: None,
+            staleness_secs: Some(7200), // 2 hours
+        };
+
+        let violations = evaluate_freshness_contract(&contract, &metrics);
+        assert!(!violations.is_empty());
+        assert!(violations[0].contains("staleness"));
+    }
+
+    #[test]
+    fn test_contract_crud_operations() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        metafuse_catalog_core::init_sqlite_schema(&conn).unwrap();
+        metafuse_catalog_core::migrations::run_migrations(&conn).unwrap();
+
+        // Create
+        let contract = DataContract {
+            id: None,
+            name: "test_contract".to_string(),
+            dataset_pattern: "test*".to_string(),
+            version: 1,
+            schema_contract: None,
+            quality_contract: None,
+            freshness_contract: None,
+            on_violation: OnViolation::Alert,
+            alert_channels: vec![],
+            enabled: true,
+        };
+
+        let id = create_contract(&conn, &contract).unwrap();
+        assert!(id > 0);
+
+        // Read
+        let retrieved = get_contract(&conn, "test_contract").unwrap().unwrap();
+        assert_eq!(retrieved.name, "test_contract");
+
+        // Update
+        let updated = DataContract {
+            id: Some(id),
+            name: "test_contract".to_string(),
+            dataset_pattern: "updated*".to_string(),
+            version: 2,
+            schema_contract: None,
+            quality_contract: None,
+            freshness_contract: None,
+            on_violation: OnViolation::Block,
+            alert_channels: vec![],
+            enabled: true,
+        };
+
+        let success = update_contract(&conn, "test_contract", &updated).unwrap();
+        assert!(success);
+
+        let after_update = get_contract(&conn, "test_contract").unwrap().unwrap();
+        assert_eq!(after_update.dataset_pattern, "updated*");
+        assert_eq!(after_update.on_violation, OnViolation::Block);
+
+        // Delete
+        let deleted = delete_contract(&conn, "test_contract").unwrap();
+        assert!(deleted);
+
+        let after_delete = get_contract(&conn, "test_contract").unwrap();
+        assert!(after_delete.is_none());
+    }
+
+    #[test]
+    fn test_find_matching_contracts_by_pattern() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        metafuse_catalog_core::init_sqlite_schema(&conn).unwrap();
+        metafuse_catalog_core::migrations::run_migrations(&conn).unwrap();
+
+        // Create contracts with different patterns
+        let c1 = DataContract {
+            id: None,
+            name: "orders_contract".to_string(),
+            dataset_pattern: "orders*".to_string(),
+            version: 1,
+            schema_contract: None,
+            quality_contract: None,
+            freshness_contract: None,
+            on_violation: OnViolation::Alert,
+            alert_channels: vec![],
+            enabled: true,
+        };
+
+        let c2 = DataContract {
+            id: None,
+            name: "raw_contract".to_string(),
+            dataset_pattern: "*_raw".to_string(),
+            version: 1,
+            schema_contract: None,
+            quality_contract: None,
+            freshness_contract: None,
+            on_violation: OnViolation::Warn,
+            alert_channels: vec![],
+            enabled: true,
+        };
+
+        create_contract(&conn, &c1).unwrap();
+        create_contract(&conn, &c2).unwrap();
+
+        // Test matching
+        let matches = find_matching_contracts(&conn, "orders_raw").unwrap();
+        assert_eq!(matches.len(), 2); // Matches both patterns
+
+        let matches = find_matching_contracts(&conn, "orders_clean").unwrap();
+        assert_eq!(matches.len(), 1); // Only matches orders*
+
+        let matches = find_matching_contracts(&conn, "customers").unwrap();
+        assert_eq!(matches.len(), 0); // Matches neither
+    }
+
+    #[test]
+    fn test_contract_evaluator_integration() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        metafuse_catalog_core::init_sqlite_schema(&conn).unwrap();
+        metafuse_catalog_core::migrations::run_migrations(&conn).unwrap();
+
+        // Create dataset with fields
+        conn.execute(
+            "INSERT INTO datasets (name, path, format, created_at, last_updated) VALUES ('orders', '/data/orders', 'delta', datetime('now'), datetime('now'))",
+            [],
+        ).unwrap();
+        let dataset_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO fields (dataset_id, name, data_type, nullable) VALUES (?1, 'order_id', 'Int64', 0)",
+            [dataset_id],
+        ).unwrap();
+
+        // Create contract requiring order_id
+        let contract = DataContract {
+            id: None,
+            name: "orders_schema".to_string(),
+            dataset_pattern: "orders".to_string(),
+            version: 1,
+            schema_contract: Some(SchemaContract {
+                required_columns: vec![RequiredColumn {
+                    name: "order_id".to_string(),
+                    data_type: "Int64".to_string(),
+                    nullable: false,
+                }],
+                allow_additional_columns: true,
+            }),
+            quality_contract: None,
+            freshness_contract: None,
+            on_violation: OnViolation::Alert,
+            alert_channels: vec![],
+            enabled: true,
+        };
+
+        create_contract(&conn, &contract).unwrap();
+
+        // Evaluate
+        let evaluator = ContractEvaluator::new(&conn);
+        let ctx = DatasetContext {
+            id: dataset_id,
+            name: "orders".to_string(),
+            tenant_id: None,
+        };
+
+        let results = evaluator.evaluate_for_dataset(&ctx).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].passed, "Contract should pass");
+    }
+}

@@ -17,6 +17,7 @@ mod audit;
 #[cfg(feature = "usage-analytics")]
 mod usage_analytics;
 
+mod health;
 mod quality;
 
 #[cfg(feature = "classification")]
@@ -946,6 +947,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Alerting background task started");
     }
 
+    // Initialize scheduled quality check background task
+    {
+        let quality_config = quality::ScheduledQualityCheckConfig::default();
+        if quality_config.enabled {
+            let delta_reader_clone = Arc::clone(&delta_reader);
+            let backend_clone = Arc::clone(&backend);
+            tokio::spawn(async move {
+                quality::quality_check_task(delta_reader_clone, backend_clone, quality_config)
+                    .await;
+            });
+            tracing::info!("Scheduled quality check background task started");
+        }
+    }
+
+    // Initialize freshness violation detection background task
+    {
+        let freshness_config = quality::FreshnessCheckConfig::default();
+        if freshness_config.enabled {
+            let backend_clone = Arc::clone(&backend);
+            tokio::spawn(async move {
+                quality::freshness_check_task(backend_clone, freshness_config).await;
+            });
+            tracing::info!("Freshness violation detection background task started");
+        }
+    }
+
+    // Initialize schema change detection background task
+    #[cfg(feature = "alerting")]
+    {
+        let schema_config = alerting::SchemaMonitorConfig::default();
+        if schema_config.enabled {
+            let delta_reader_clone = Arc::clone(&delta_reader);
+            let webhook_client = Arc::new(alerting::WebhookClient::new_default());
+            let backend_clone = Arc::clone(&backend);
+            tokio::spawn(async move {
+                alerting::schema_monitor_task(
+                    delta_reader_clone,
+                    webhook_client,
+                    backend_clone,
+                    schema_config,
+                )
+                .await;
+            });
+            tracing::info!("Schema change detection background task started");
+        }
+    }
+
     // Initialize multi-tenant resources
     let mt_config = MultiTenantConfig::from_env();
     mt_config.validate()?;
@@ -970,7 +1018,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build router with conditional feature routes
     let app = Router::new()
-        .route("/health", get(health_check))
+        // Health check endpoints (Kubernetes-compatible)
+        .route("/health", get(health::health_check))
+        .route("/ready", get(health::readiness_check))
+        .route("/live", get(health::liveness_check))
         // Dataset endpoints
         .route("/api/v1/datasets", get(list_datasets).post(create_dataset))
         .route(
@@ -1058,7 +1109,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/v1/datasets/:name/quality",
             get(get_dataset_quality).post(compute_dataset_quality),
         )
-        .route("/api/v1/quality/unhealthy", get(get_unhealthy_datasets));
+        .route("/api/v1/quality/unhealthy", get(get_unhealthy_datasets))
+        // Quality check management endpoints (v1.7.0)
+        .route(
+            "/api/v1/datasets/:name/quality/checks",
+            get(list_quality_checks).post(create_quality_check),
+        )
+        .route(
+            "/api/v1/datasets/:name/quality/checks/:check_id",
+            get(get_quality_check).delete(delete_quality_check),
+        )
+        .route(
+            "/api/v1/datasets/:name/quality/execute",
+            post(execute_quality_checks),
+        )
+        .route(
+            "/api/v1/datasets/:name/quality/results",
+            get(get_quality_results),
+        )
+        // Freshness violation endpoints (v1.7.0)
+        .route(
+            "/api/v1/datasets/:name/freshness/violations",
+            get(get_dataset_freshness_violations),
+        )
+        .route(
+            "/api/v1/freshness/violations",
+            get(get_all_freshness_violations),
+        );
 
     // Tenant self-service usage endpoint (requires api-keys for auth)
     #[cfg(feature = "api-keys")]
@@ -1259,6 +1336,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app
     };
 
+    // Clone multi_tenant for shutdown handler before moving state
+    let multi_tenant_for_shutdown = state.multi_tenant.clone();
     let app = app.layer(CorsLayer::permissive()).with_state(state);
 
     // Get port from environment or use default
@@ -1275,9 +1354,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("MetaFuse API listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
 
+    // Graceful shutdown with signal handling
+    let shutdown = shutdown_signal(multi_tenant_for_shutdown);
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
+
+    tracing::info!("Server shutdown complete");
     Ok(())
+}
+
+/// Create shutdown signal handler for graceful termination
+///
+/// Handles SIGINT (Ctrl+C) and SIGTERM signals for graceful shutdown.
+/// Background tasks (audit logger, usage tracker) will flush their buffers
+/// when their channels are closed during shutdown.
+async fn shutdown_signal(multi_tenant: multi_tenant::MultiTenantResources) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("Received SIGINT (Ctrl+C), initiating graceful shutdown...");
+        }
+        _ = terminate => {
+            tracing::info!("Received SIGTERM, initiating graceful shutdown...");
+        }
+    }
+
+    // Perform cleanup
+    tracing::info!("Initiating graceful shutdown...");
+
+    // Clear multi-tenant caches
+    if multi_tenant.is_enabled() {
+        multi_tenant.clear_all_caches();
+        tracing::info!("Multi-tenant caches cleared");
+    }
+
+    // Note: Audit logs and usage stats are flushed by their background tasks
+    // when their channels close during the shutdown sequence.
+    tracing::info!("Background tasks will flush pending data on exit");
 }
 
 /// Middleware to add request ID to every request and create tracing span
@@ -1358,11 +1490,6 @@ fn extract_client_ip(req: &Request) -> Option<String> {
 
     // Fallback: could extract from connection info but axum doesn't expose it directly here
     None
-}
-
-/// Health check endpoint
-async fn health_check() -> &'static str {
-    "ok"
 }
 
 // =============================================================================
@@ -1987,6 +2114,16 @@ async fn list_datasets(
 
     #[cfg(feature = "metrics")]
     metrics::record_catalog_operation("list_datasets", "success");
+
+    // Track search appearances for all returned datasets (non-blocking)
+    #[cfg(feature = "usage-analytics")]
+    {
+        let tracker = state.usage_tracker.clone();
+        let dataset_ids: Vec<i64> = datasets.iter().map(|d| d.id).collect();
+        tokio::spawn(async move {
+            tracker.record_search_appearances(&dataset_ids, None).await;
+        });
+    }
 
     Ok(Json(datasets))
 }
@@ -2777,6 +2914,884 @@ async fn get_unhealthy_datasets(
 }
 
 // =============================================================================
+// Quality Check Management Handlers (v1.7.0)
+// =============================================================================
+
+/// Response for quality check list
+#[derive(Debug, Serialize)]
+struct QualityChecksListResponse {
+    dataset_id: i64,
+    dataset_name: String,
+    checks: Vec<QualityCheckResponse>,
+}
+
+/// Individual quality check response
+#[derive(Debug, Serialize)]
+struct QualityCheckResponse {
+    id: String,
+    check_type: String,
+    check_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    check_description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    check_config: Option<String>,
+    severity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warn_threshold: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fail_threshold: Option<f64>,
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schedule: Option<String>,
+    on_demand: bool,
+    created_at: String,
+}
+
+/// Response for quality check execution
+#[derive(Debug, Serialize)]
+struct ExecuteQualityChecksResponse {
+    dataset_id: i64,
+    dataset_name: String,
+    checks_executed: usize,
+    results: Vec<quality::QualityCheckExecutionResponse>,
+}
+
+/// Response for quality check results history
+#[derive(Debug, Serialize)]
+struct QualityResultsResponse {
+    dataset_id: i64,
+    dataset_name: String,
+    results: Vec<QualityResultEntry>,
+}
+
+/// Individual quality result entry
+#[derive(Debug, Serialize)]
+struct QualityResultEntry {
+    id: String,
+    check_id: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    records_checked: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    records_failed: Option<i64>,
+    executed_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_time_ms: Option<i64>,
+    execution_mode: String,
+}
+
+/// Query params for quality results
+#[derive(Debug, Deserialize)]
+struct QualityResultsQueryParams {
+    #[serde(default = "default_results_limit")]
+    limit: i64,
+}
+
+fn default_results_limit() -> i64 {
+    100
+}
+
+/// List quality checks for a dataset
+async fn list_quality_checks(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    Path(name): Path<String>,
+) -> Result<Json<QualityChecksListResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, dataset_name = %name, "Listing quality checks");
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Look up dataset
+    let dataset: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, name FROM datasets WHERE name = ?1",
+            [&name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+
+    let (dataset_id, dataset_name) = dataset.ok_or_else(|| {
+        not_found(
+            format!("Dataset '{}' not found", name),
+            request_id.0.clone(),
+        )
+    })?;
+
+    // Get quality checks
+    let checks = quality::get_quality_checks(&conn, dataset_id)
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let check_responses: Vec<QualityCheckResponse> = checks
+        .into_iter()
+        .map(|c| QualityCheckResponse {
+            id: c.id,
+            check_type: c.check_type.to_string(),
+            check_name: c.check_name,
+            check_description: c.check_description,
+            check_config: c.check_config,
+            severity: c.severity.to_string(),
+            warn_threshold: c.warn_threshold,
+            fail_threshold: c.fail_threshold,
+            enabled: c.enabled,
+            schedule: c.schedule,
+            on_demand: c.on_demand,
+            created_at: c.created_at.to_rfc3339(),
+        })
+        .collect();
+
+    tracing::info!(
+        dataset_name = %name,
+        check_count = check_responses.len(),
+        "Quality checks listed"
+    );
+
+    Ok(Json(QualityChecksListResponse {
+        dataset_id,
+        dataset_name,
+        checks: check_responses,
+    }))
+}
+
+/// Create a new quality check for a dataset
+async fn create_quality_check(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(audit_ctx): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    Path(name): Path<String>,
+    Json(request): Json<quality::CreateQualityCheckRequest>,
+) -> Result<(StatusCode, Json<QualityCheckResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
+    tracing::info!(tenant_id = %tenant_id, dataset_name = %name, check_name = %request.check_name, "Creating quality check");
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Look up dataset
+    let dataset_id: i64 = conn
+        .query_row("SELECT id FROM datasets WHERE name = ?1", [&name], |row| {
+            row.get(0)
+        })
+        .map_err(|_| {
+            not_found(
+                format!("Dataset '{}' not found", name),
+                request_id.0.clone(),
+            )
+        })?;
+
+    // Create the quality check
+    let check = quality::create_quality_check(
+        &conn,
+        dataset_id,
+        &request,
+        audit_ctx.api_key_id.as_deref(),
+        Some(tenant_id),
+    )
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: e.to_string(),
+                request_id: request_id.0.clone(),
+            }),
+        )
+    })?;
+
+    tracing::info!(
+        dataset_name = %name,
+        check_id = %check.id,
+        check_name = %check.check_name,
+        "Quality check created"
+    );
+
+    // Emit audit event (non-blocking)
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::create(
+            "quality_check",
+            &check.id,
+            serde_json::json!({
+                "id": check.id,
+                "dataset_name": name,
+                "check_name": check.check_name,
+                "check_type": check.check_type.to_string(),
+                "severity": check.severity.to_string(),
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_ctx.enrich_event(event));
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(QualityCheckResponse {
+            id: check.id,
+            check_type: check.check_type.to_string(),
+            check_name: check.check_name,
+            check_description: check.check_description,
+            check_config: check.check_config,
+            severity: check.severity.to_string(),
+            warn_threshold: check.warn_threshold,
+            fail_threshold: check.fail_threshold,
+            enabled: check.enabled,
+            schedule: check.schedule,
+            on_demand: check.on_demand,
+            created_at: check.created_at.to_rfc3339(),
+        }),
+    ))
+}
+
+/// Path params for quality check operations
+#[derive(Debug, Deserialize)]
+struct QualityCheckPathParams {
+    name: String,
+    check_id: String,
+}
+
+/// Get a specific quality check
+async fn get_quality_check(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    Path(params): Path<QualityCheckPathParams>,
+) -> Result<Json<QualityCheckResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, dataset_name = %params.name, check_id = %params.check_id, "Getting quality check");
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Get the quality check
+    let check = quality::get_quality_check(&conn, &params.check_id)
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
+        .ok_or_else(|| {
+            not_found(
+                format!("Quality check '{}' not found", params.check_id),
+                request_id.0.clone(),
+            )
+        })?;
+
+    Ok(Json(QualityCheckResponse {
+        id: check.id,
+        check_type: check.check_type.to_string(),
+        check_name: check.check_name,
+        check_description: check.check_description,
+        check_config: check.check_config,
+        severity: check.severity.to_string(),
+        warn_threshold: check.warn_threshold,
+        fail_threshold: check.fail_threshold,
+        enabled: check.enabled,
+        schedule: check.schedule,
+        on_demand: check.on_demand,
+        created_at: check.created_at.to_rfc3339(),
+    }))
+}
+
+/// Delete a quality check
+async fn delete_quality_check(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(audit_ctx): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    Path(params): Path<QualityCheckPathParams>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
+    tracing::info!(tenant_id = %tenant_id, dataset_name = %params.name, check_id = %params.check_id, "Deleting quality check");
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let deleted = quality::delete_quality_check(&conn, &params.check_id)
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    if deleted {
+        tracing::info!(check_id = %params.check_id, "Quality check deleted");
+
+        // Emit audit event (non-blocking)
+        #[cfg(feature = "audit")]
+        {
+            let event = audit::AuditEvent::delete(
+                "quality_check",
+                &params.check_id,
+                serde_json::json!({
+                    "check_id": params.check_id,
+                    "dataset_name": params.name,
+                }),
+                &request_id.0,
+            );
+            state.audit_logger.log(audit_ctx.enrich_event(event));
+        }
+
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(not_found(
+            format!("Quality check '{}' not found", params.check_id),
+            request_id.0,
+        ))
+    }
+}
+
+/// Execute quality checks for a dataset on-demand
+async fn execute_quality_checks(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    Path(name): Path<String>,
+) -> Result<Json<ExecuteQualityChecksResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
+    tracing::info!(tenant_id = %tenant_id, dataset_name = %name, "Executing quality checks on-demand");
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+
+    // Phase 1: Fetch all data from DB (sync)
+    let (dataset_id, dataset_name, delta_location, on_demand_checks, freshness_configs) = {
+        let conn = backend
+            .get_connection()
+            .await
+            .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+        // Look up dataset and delta_location
+        let dataset: Option<(i64, String, Option<String>)> = conn
+            .query_row(
+                "SELECT id, name, delta_location FROM datasets WHERE name = ?1",
+                [&name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .ok();
+
+        let (dataset_id, dataset_name, delta_location) = dataset.ok_or_else(|| {
+            not_found(
+                format!("Dataset '{}' not found", name),
+                request_id.0.clone(),
+            )
+        })?;
+
+        // Get enabled quality checks that support on-demand execution
+        let checks = quality::get_quality_checks(&conn, dataset_id)
+            .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+        let on_demand_checks: Vec<_> = checks.into_iter().filter(|c| c.on_demand).collect();
+
+        // Pre-fetch freshness configs for all checks
+        let freshness_configs: HashMap<i64, (i64, i64)> = conn
+            .query_row(
+                "SELECT expected_interval_secs, grace_period_secs FROM freshness_config WHERE dataset_id = ?1",
+                [dataset_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok()
+            .map(|config| {
+                let mut map = HashMap::new();
+                map.insert(dataset_id, config);
+                map
+            })
+            .unwrap_or_default();
+
+        (
+            dataset_id,
+            dataset_name,
+            delta_location,
+            on_demand_checks,
+            freshness_configs,
+        )
+    }; // conn dropped here
+
+    if on_demand_checks.is_empty() {
+        return Ok(Json(ExecuteQualityChecksResponse {
+            dataset_id,
+            dataset_name,
+            checks_executed: 0,
+            results: vec![],
+        }));
+    }
+
+    // Phase 2: Get Delta metadata if needed (async, no DB connection)
+    let delta_metadata = if let Some(ref loc) = delta_location {
+        Some(
+            state
+                .delta_reader
+                .get_metadata_cached(loc)
+                .await
+                .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?,
+        )
+    } else {
+        None
+    };
+
+    // Phase 3: Execute checks and build results (no DB during check execution)
+    let executor = quality::QualityCheckExecutor::new(Arc::clone(&state.delta_reader));
+    let mut check_results = Vec::new();
+
+    for check in &on_demand_checks {
+        let start = std::time::Instant::now();
+        let result_id = uuid::Uuid::new_v4().to_string();
+
+        // Execute check based on type using pre-fetched data
+        let (score, details, records_checked, records_failed, status) = match check.check_type {
+            metafuse_catalog_core::QualityCheckType::Completeness => {
+                if let Some(ref metadata) = delta_metadata {
+                    let row_count = metadata.row_count;
+                    let column_count = metadata.schema.fields.len() as i64;
+
+                    if row_count == 0 || column_count == 0 {
+                        (
+                            1.0,
+                            Some(r#"{"status":"empty_table"}"#.to_string()),
+                            0,
+                            0,
+                            metafuse_catalog_core::QualityCheckStatus::Pass,
+                        )
+                    } else {
+                        let total_nulls: i64 = metadata
+                            .column_stats
+                            .iter()
+                            .filter_map(|s| s.null_count)
+                            .sum();
+                        let total_cells = row_count * column_count;
+                        let null_ratio = total_nulls as f64 / total_cells as f64;
+                        let score = (1.0 - null_ratio).clamp(0.0, 1.0);
+                        let details = serde_json::json!({
+                            "row_count": row_count,
+                            "column_count": column_count,
+                            "total_cells": total_cells,
+                            "null_cells": total_nulls,
+                            "null_ratio": null_ratio,
+                        });
+                        let status = executor.determine_status_from_score(score, check);
+                        (
+                            score,
+                            Some(details.to_string()),
+                            total_cells,
+                            total_nulls,
+                            status,
+                        )
+                    }
+                } else {
+                    (
+                        1.0,
+                        Some(r#"{"status":"no_delta_metadata"}"#.to_string()),
+                        0,
+                        0,
+                        metafuse_catalog_core::QualityCheckStatus::Pass,
+                    )
+                }
+            }
+            metafuse_catalog_core::QualityCheckType::Freshness => {
+                if let Some((expected_interval, grace_period)) = freshness_configs.get(&dataset_id)
+                {
+                    let last_modified = delta_metadata
+                        .as_ref()
+                        .map(|m| m.last_modified)
+                        .unwrap_or_else(chrono::Utc::now);
+
+                    let now = chrono::Utc::now();
+                    let staleness_secs = (now - last_modified).num_seconds();
+                    let threshold_secs = expected_interval + grace_period;
+
+                    let score = if staleness_secs <= threshold_secs {
+                        1.0
+                    } else {
+                        let extra_staleness = staleness_secs - threshold_secs;
+                        let periods_overdue = extra_staleness as f64 / *expected_interval as f64;
+                        (1.0 / (1.0 + periods_overdue)).clamp(0.0, 1.0)
+                    };
+
+                    let details = serde_json::json!({
+                        "last_modified": last_modified.to_rfc3339(),
+                        "staleness_secs": staleness_secs,
+                        "expected_interval_secs": expected_interval,
+                        "grace_period_secs": grace_period,
+                        "threshold_secs": threshold_secs,
+                    });
+                    let failed = if score < 1.0 { 1 } else { 0 };
+                    let status = executor.determine_status_from_score(score, check);
+                    (score, Some(details.to_string()), 1, failed, status)
+                } else {
+                    (
+                        1.0,
+                        Some(r#"{"status":"no_freshness_config"}"#.to_string()),
+                        0,
+                        0,
+                        metafuse_catalog_core::QualityCheckStatus::Skipped,
+                    )
+                }
+            }
+            _ => {
+                // Uniqueness and Custom checks require external execution
+                let details = serde_json::json!({
+                    "status": "requires_external_execution",
+                    "message": "This check type requires external data scanning",
+                    "check_config": check.check_config,
+                });
+                (
+                    1.0,
+                    Some(details.to_string()),
+                    0,
+                    0,
+                    metafuse_catalog_core::QualityCheckStatus::Skipped,
+                )
+            }
+        };
+
+        let execution_time_ms = start.elapsed().as_millis() as i64;
+
+        check_results.push(metafuse_catalog_core::QualityCheckResult {
+            id: result_id,
+            check_id: check.id.clone(),
+            dataset_id,
+            status,
+            score: Some(score),
+            details,
+            error_message: None,
+            records_checked: Some(records_checked),
+            records_failed: Some(records_failed),
+            executed_at: chrono::Utc::now(),
+            execution_time_ms: Some(execution_time_ms),
+            execution_mode: metafuse_catalog_core::QualityCheckExecutionMode::OnDemand,
+            delta_version: delta_metadata.as_ref().map(|m| m.version),
+        });
+    }
+
+    // Phase 4: Store results (new connection)
+    let conn = backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let mut results = Vec::new();
+    for (result, check) in check_results.iter().zip(on_demand_checks.iter()) {
+        quality::store_quality_check_result(&conn, result)
+            .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+        results.push(quality::QualityCheckExecutionResponse {
+            check_id: result.check_id.clone(),
+            check_name: check.check_name.clone(),
+            dataset_id: result.dataset_id,
+            status: result.status.to_string(),
+            score: result.score,
+            details: result.details.clone(),
+            records_checked: result.records_checked,
+            records_failed: result.records_failed,
+            execution_time_ms: result.execution_time_ms.unwrap_or(0),
+            executed_at: result.executed_at.to_rfc3339(),
+        });
+    }
+
+    tracing::info!(
+        dataset_name = %name,
+        checks_executed = results.len(),
+        "Quality checks executed"
+    );
+
+    Ok(Json(ExecuteQualityChecksResponse {
+        dataset_id,
+        dataset_name,
+        checks_executed: results.len(),
+        results,
+    }))
+}
+
+/// Get quality check results history for a dataset
+async fn get_quality_results(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    Path(name): Path<String>,
+    Query(params): Query<QualityResultsQueryParams>,
+) -> Result<Json<QualityResultsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, dataset_name = %name, limit = params.limit, "Getting quality results");
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Look up dataset
+    let dataset: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, name FROM datasets WHERE name = ?1",
+            [&name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+
+    let (dataset_id, dataset_name) = dataset.ok_or_else(|| {
+        not_found(
+            format!("Dataset '{}' not found", name),
+            request_id.0.clone(),
+        )
+    })?;
+
+    // Get quality results
+    let results = quality::get_quality_check_results(&conn, dataset_id, Some(params.limit))
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let result_entries: Vec<QualityResultEntry> = results
+        .into_iter()
+        .map(|r| QualityResultEntry {
+            id: r.id,
+            check_id: r.check_id,
+            status: r.status.to_string(),
+            score: r.score,
+            details: r.details,
+            error_message: r.error_message,
+            records_checked: r.records_checked,
+            records_failed: r.records_failed,
+            executed_at: r.executed_at.to_rfc3339(),
+            execution_time_ms: r.execution_time_ms,
+            execution_mode: r.execution_mode.to_string(),
+        })
+        .collect();
+
+    tracing::info!(
+        dataset_name = %name,
+        result_count = result_entries.len(),
+        "Quality results retrieved"
+    );
+
+    Ok(Json(QualityResultsResponse {
+        dataset_id,
+        dataset_name,
+        results: result_entries,
+    }))
+}
+
+// =============================================================================
+// Freshness Violation Handlers (v1.7.0)
+// =============================================================================
+
+/// Query parameters for freshness violations
+#[derive(Debug, Deserialize)]
+struct FreshnessViolationsQuery {
+    /// Limit results (default 50)
+    #[serde(default = "default_violation_limit")]
+    limit: i64,
+    /// Include resolved violations (default false)
+    #[serde(default)]
+    include_resolved: bool,
+}
+
+fn default_violation_limit() -> i64 {
+    50
+}
+
+/// Response for freshness violations
+#[derive(Debug, Serialize)]
+struct FreshnessViolationsResponse {
+    dataset_id: Option<i64>,
+    dataset_name: Option<String>,
+    violations: Vec<FreshnessViolationEntry>,
+    total_count: usize,
+}
+
+/// A single freshness violation entry
+#[derive(Debug, Serialize)]
+struct FreshnessViolationEntry {
+    id: String,
+    dataset_id: i64,
+    expected_by: String,
+    detected_at: String,
+    resolved_at: Option<String>,
+    sla: String,
+    grace_period_minutes: Option<i32>,
+    hours_overdue: Option<f64>,
+    last_updated_at: Option<String>,
+    alert_sent: bool,
+    status: String,
+}
+
+impl From<metafuse_catalog_core::FreshnessViolation> for FreshnessViolationEntry {
+    fn from(v: metafuse_catalog_core::FreshnessViolation) -> Self {
+        let status = if v.resolved_at.is_some() {
+            "resolved"
+        } else {
+            "open"
+        };
+        Self {
+            id: v.id,
+            dataset_id: v.dataset_id,
+            expected_by: v.expected_by.to_rfc3339(),
+            detected_at: v.detected_at.to_rfc3339(),
+            resolved_at: v.resolved_at.map(|t| t.to_rfc3339()),
+            sla: v.sla,
+            grace_period_minutes: v.grace_period_minutes,
+            hours_overdue: v.hours_overdue,
+            last_updated_at: v.last_updated_at.map(|t| t.to_rfc3339()),
+            alert_sent: v.alert_sent,
+            status: status.to_string(),
+        }
+    }
+}
+
+/// Get freshness violations for a specific dataset
+async fn get_dataset_freshness_violations(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    Path(name): Path<String>,
+    Query(params): Query<FreshnessViolationsQuery>,
+) -> Result<Json<FreshnessViolationsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
+    tracing::debug!(
+        tenant_id = %tenant_id,
+        dataset_name = %name,
+        limit = params.limit,
+        include_resolved = params.include_resolved,
+        "Getting dataset freshness violations"
+    );
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Look up dataset
+    let dataset: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, name FROM datasets WHERE name = ?1",
+            [&name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+
+    let (dataset_id, dataset_name) = dataset.ok_or_else(|| {
+        not_found(
+            format!("Dataset '{}' not found", name),
+            request_id.0.clone(),
+        )
+    })?;
+
+    // Get violations based on params
+    let violations = if params.include_resolved {
+        quality::get_dataset_violations(&conn, dataset_id, params.limit)
+    } else {
+        quality::get_open_violations(&conn, Some(dataset_id))
+    }
+    .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let total_count = violations.len();
+    let entries: Vec<FreshnessViolationEntry> = violations.into_iter().map(Into::into).collect();
+
+    tracing::info!(
+        dataset_name = %name,
+        violation_count = total_count,
+        "Freshness violations retrieved"
+    );
+
+    Ok(Json(FreshnessViolationsResponse {
+        dataset_id: Some(dataset_id),
+        dataset_name: Some(dataset_name),
+        violations: entries,
+        total_count,
+    }))
+}
+
+/// Query parameters for all violations endpoint
+#[derive(Debug, Deserialize)]
+struct AllViolationsQuery {
+    /// Limit results (default 50, max 200)
+    #[serde(default = "default_violation_limit")]
+    limit: i64,
+    /// Offset for pagination
+    #[serde(default)]
+    offset: i64,
+}
+
+/// Get all open freshness violations across all datasets
+async fn get_all_freshness_violations(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    Query(params): Query<AllViolationsQuery>,
+) -> Result<Json<FreshnessViolationsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
+
+    // Cap limit at 200 to prevent unbounded responses
+    let limit = params.limit.clamp(1, 200);
+    let offset = params.offset.max(0);
+
+    tracing::debug!(
+        tenant_id = %tenant_id,
+        limit,
+        offset,
+        "Getting all open freshness violations"
+    );
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Get all open violations with pagination
+    let violations = quality::get_open_violations_paginated(&conn, limit, offset)
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let total_count = violations.len();
+    let entries: Vec<FreshnessViolationEntry> = violations.into_iter().map(Into::into).collect();
+
+    tracing::info!(
+        violation_count = total_count,
+        "All open freshness violations retrieved"
+    );
+
+    Ok(Json(FreshnessViolationsResponse {
+        dataset_id: None,
+        dataset_name: None,
+        violations: entries,
+        total_count,
+    }))
+}
+
+// =============================================================================
 // Classification Handlers
 // =============================================================================
 
@@ -2864,6 +3879,7 @@ async fn get_dataset_classifications(
 async fn scan_dataset_classifications(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(audit_ctx): Extension<AuditContext>,
     tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
 ) -> Result<Json<classification::DatasetClassificationsResponse>, (StatusCode, Json<ErrorResponse>)>
@@ -2966,6 +3982,23 @@ async fn scan_dataset_classifications(
         "Dataset classification scan completed"
     );
 
+    // Emit audit event (non-blocking)
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::create(
+            "classification_scan",
+            &name,
+            serde_json::json!({
+                "dataset_name": name,
+                "dataset_id": response.dataset_id,
+                "pii_count": response.pii_count,
+                "fields_scanned": fields_scanned,
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_ctx.enrich_event(event));
+    }
+
     Ok(Json(response))
 }
 
@@ -3018,6 +4051,7 @@ async fn get_all_pii_columns(
 async fn set_field_classification(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(audit_ctx): Extension<AuditContext>,
     tenant_backend: Option<Extension<TenantBackend>>,
     Path(field_id): Path<i64>,
     Json(req): Json<classification::SetClassificationRequest>,
@@ -3076,6 +4110,23 @@ async fn set_field_classification(
     })?;
 
     tracing::info!(field_id, "Manual classification set");
+
+    // Emit audit event (non-blocking)
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::update(
+            "field_classification",
+            field_id.to_string(),
+            serde_json::json!({}), // old values not tracked for simplicity
+            serde_json::json!({
+                "field_id": field_id,
+                "classification": req.classification,
+                "category": req.category,
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_ctx.enrich_event(event));
+    }
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -3685,6 +4736,136 @@ async fn update_dataset(
             },
         )
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Resolve any open freshness violations for this dataset (data was updated)
+    match quality::resolve_freshness_violations(&conn, dataset_id, chrono::Utc::now()) {
+        Ok(resolved) if resolved > 0 => {
+            tracing::info!(
+                dataset_id,
+                resolved_count = resolved,
+                "Auto-resolved freshness violations on dataset update"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                dataset_id,
+                error = %e,
+                "Failed to resolve freshness violations on dataset update"
+            );
+        }
+        _ => {}
+    }
+
+    // Evaluate data contracts on update (v0.9.0)
+    //
+    // FAIL-OPEN BEHAVIOR: Contract evaluation requires delta_location to be set.
+    // For non-Delta datasets (CSV, Parquet, etc.), we skip contract evaluation
+    // entirely rather than blocking the update. This ensures backwards compatibility
+    // and allows gradual contract adoption. Operators can enforce Delta-only ingestion
+    // at the organizational level if strict contract enforcement is required.
+    #[cfg(feature = "contracts")]
+    {
+        let has_delta: bool = dataset.delta_location.is_some();
+
+        if has_delta {
+            let ctx = contracts::DatasetContext {
+                id: dataset_id,
+                name: dataset.name.clone(),
+                tenant_id: Some(tenant_id.to_string()),
+            };
+
+            let evaluator = contracts::ContractEvaluator::new(&conn);
+            match evaluator.evaluate_for_dataset(&ctx) {
+                Ok(results) => {
+                    for result in results {
+                        if !result.passed {
+                            tracing::warn!(
+                                dataset_name = %dataset.name,
+                                contract_name = %result.contract_name,
+                                violations = ?result.violations,
+                                "Contract violation detected"
+                            );
+
+                            // Get the contract to determine enforcement action
+                            if let Ok(Some(contract)) =
+                                contracts::get_contract(&conn, &result.contract_name)
+                            {
+                                let action =
+                                    evaluator.determine_enforcement(&contract, &result.violations);
+
+                                match action {
+                                    contracts::EnforcementAction::Block(violations) => {
+                                        // Return error to block the update
+                                        return Err(bad_request(
+                                            format!(
+                                                "Contract '{}' violated: {}",
+                                                contract.name,
+                                                violations.join("; ")
+                                            ),
+                                            request_id.0.clone(),
+                                        ));
+                                    }
+                                    contracts::EnforcementAction::Alert(violations) => {
+                                        // Send alert asynchronously
+                                        #[cfg(feature = "alerting")]
+                                        {
+                                            let payload =
+                                                alerting::AlertPayload::contract_violation(
+                                                    &dataset.name,
+                                                    dataset_id,
+                                                    &contract.name,
+                                                    &violations,
+                                                );
+
+                                            // Send to contract's alert channels
+                                            for channel in &contract.alert_channels {
+                                                let client = alerting::WebhookClient::new_default();
+                                                let url = channel.clone();
+                                                let payload_clone = payload.clone();
+                                                tokio::spawn(async move {
+                                                    if let Err(e) =
+                                                        client.send(&url, &payload_clone).await
+                                                    {
+                                                        tracing::warn!(
+                                                            error = %e,
+                                                            url = %url,
+                                                            "Failed to send contract violation alert"
+                                                        );
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }
+                                    contracts::EnforcementAction::Warn(violations) => {
+                                        tracing::warn!(
+                                            dataset_name = %dataset.name,
+                                            contract_name = %contract.name,
+                                            violations = ?violations,
+                                            "Contract violation (warn mode)"
+                                        );
+                                    }
+                                    contracts::EnforcementAction::Allow => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Fail open - log error but don't block the update
+                    tracing::warn!(
+                        dataset_id,
+                        error = %e,
+                        "Failed to evaluate contracts, failing open"
+                    );
+                }
+            }
+        } else {
+            tracing::debug!(
+                dataset_id,
+                "Skipping contract evaluation - no delta_location"
+            );
+        }
+    }
 
     tracing::info!(name = %name, "Dataset updated successfully");
 
@@ -6998,6 +8179,7 @@ async fn list_contracts(
 async fn create_contract(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(audit_ctx): Extension<AuditContext>,
     tenant_backend: Option<Extension<TenantBackend>>,
     Json(contract): Json<contracts::DataContract>,
 ) -> Result<Json<ContractCreatedResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -7036,6 +8218,23 @@ async fn create_contract(
             internal_error(e.to_string(), request_id.0.clone())
         }
     })?;
+
+    // Emit audit event (non-blocking)
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::create(
+            "contract",
+            &contract.name,
+            serde_json::json!({
+                "id": id,
+                "name": contract.name,
+                "version": contract.version,
+                "dataset_pattern": contract.dataset_pattern,
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_ctx.enrich_event(event));
+    }
 
     Ok(Json(ContractCreatedResponse {
         id,
@@ -7089,6 +8288,7 @@ async fn get_contract(
 async fn update_contract(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(audit_ctx): Extension<AuditContext>,
     tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
     Json(contract): Json<contracts::DataContract>,
@@ -7128,6 +8328,23 @@ async fn update_contract(
         ));
     }
 
+    // Emit audit event (non-blocking)
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::update(
+            "contract",
+            &name,
+            serde_json::json!({}), // old values not tracked for simplicity
+            serde_json::json!({
+                "name": name,
+                "version": contract.version,
+                "dataset_pattern": contract.dataset_pattern,
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_ctx.enrich_event(event));
+    }
+
     Ok(Json(ContractUpdatedResponse {
         name,
         version: contract.version,
@@ -7148,6 +8365,7 @@ struct ContractUpdatedResponse {
 async fn delete_contract(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(audit_ctx): Extension<AuditContext>,
     tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
 ) -> Result<Json<ContractDeletedResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -7171,6 +8389,18 @@ async fn delete_contract(
             format!("Contract '{}' not found", name),
             request_id.0.clone(),
         ));
+    }
+
+    // Emit audit event (non-blocking)
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::delete(
+            "contract",
+            &name,
+            serde_json::json!({ "name": name }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_ctx.enrich_event(event));
     }
 
     Ok(Json(ContractDeletedResponse {
@@ -7209,6 +8439,7 @@ async fn lineage_parse(
 async fn lineage_record(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(audit_ctx): Extension<AuditContext>,
     tenant_backend: Option<Extension<TenantBackend>>,
     #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
     Json(request): Json<lineage::RecordLineageRequest>,
@@ -7284,6 +8515,25 @@ async fn lineage_record(
     #[cfg(feature = "metrics")]
     metrics::record_lineage_operation("record", "success");
 
+    // Emit audit event (non-blocking)
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::create(
+            "column_lineage",
+            format!(
+                "{}:{}",
+                request.source_dataset_id, request.target_dataset_id
+            ),
+            serde_json::json!({
+                "source_dataset_id": request.source_dataset_id,
+                "target_dataset_id": request.target_dataset_id,
+                "edges_recorded": edges_recorded,
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_ctx.enrich_event(event));
+    }
+
     Ok(Json(lineage::RecordLineageResponse { edges_recorded }))
 }
 
@@ -7345,6 +8595,17 @@ async fn lineage_upstream(
     #[cfg(feature = "metrics")]
     metrics::record_lineage_query("upstream", "success");
 
+    // Track usage (non-blocking)
+    #[cfg(feature = "usage-analytics")]
+    {
+        let tracker = state.usage_tracker.clone();
+        tokio::spawn(async move {
+            tracker
+                .record_access(dataset_id, None, usage_analytics::AccessType::LineageQuery)
+                .await;
+        });
+    }
+
     lineage::get_upstream_lineage(
         State(lineage_state),
         Path((dataset_id, column)),
@@ -7370,6 +8631,17 @@ async fn lineage_downstream(
     #[cfg(feature = "metrics")]
     metrics::record_lineage_query("downstream", "success");
 
+    // Track usage (non-blocking)
+    #[cfg(feature = "usage-analytics")]
+    {
+        let tracker = state.usage_tracker.clone();
+        tokio::spawn(async move {
+            tracker
+                .record_access(dataset_id, None, usage_analytics::AccessType::LineageQuery)
+                .await;
+        });
+    }
+
     lineage::get_downstream_lineage(
         State(lineage_state),
         Path((dataset_id, column)),
@@ -7394,6 +8666,17 @@ async fn lineage_pii_propagation(
 
     #[cfg(feature = "metrics")]
     metrics::record_lineage_query("pii_propagation", "success");
+
+    // Track usage (non-blocking)
+    #[cfg(feature = "usage-analytics")]
+    {
+        let tracker = state.usage_tracker.clone();
+        tokio::spawn(async move {
+            tracker
+                .record_access(dataset_id, None, usage_analytics::AccessType::LineageQuery)
+                .await;
+        });
+    }
 
     lineage::get_pii_propagation(
         State(lineage_state),
